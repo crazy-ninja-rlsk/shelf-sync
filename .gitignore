@@ -1,0 +1,5 @@
+config.local.json
+*.json
+reports/
+__pycache__/
+*.bak
