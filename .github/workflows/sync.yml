@@ -1,0 +1,65 @@
+name: sync
+
+on:
+  schedule:
+    # every 10 minutes, Mon-Fri; the exact local window is checked by the script
+    - cron: "*/10 5-17 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+      GOOGLE_KEY_JSON: ${{ secrets.GOOGLE_KEY_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: deps
+        run: pip install -q -r requirements.txt > /dev/null
+
+      - name: check
+        id: check
+        run: python sync.py --check
+
+      - name: server
+        if: steps.check.outputs.need == '1'
+        run: |
+          PW="$(openssl rand -hex 16)Aa1!"
+          echo "::add-mask::$PW"
+          echo "SQL_PASSWORD=$PW" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bak" && chmod 777 "$RUNNER_TEMP/bak"
+          echo "BACKUP_DIR=$RUNNER_TEMP/bak" >> "$GITHUB_ENV"
+          docker run -d --name db -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$PW" -p 1433:1433 \
+            -v "$RUNNER_TEMP/bak:/bak" mcr.microsoft.com/mssql/server:2022-latest > /dev/null
+          if ! dpkg -s msodbcsql18 > /dev/null 2>&1; then
+            curl -sSL "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb" -o /tmp/p.deb
+            sudo dpkg -i /tmp/p.deb > /dev/null
+            sudo apt-get update -qq > /dev/null
+            sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18 > /dev/null
+          fi
+
+      - name: update
+        if: steps.check.outputs.need == '1'
+        run: python sync.py --write
+
+      # scheduled workflows in inactive public repos are paused after 60 days
+      - name: keepalive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/sync.yml/enable" > /dev/null 2>&1 || true
