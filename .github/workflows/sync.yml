@@ -3,7 +3,7 @@ name: sync
 on:
   schedule:
     # every 10 minutes, Mon-Fri; the exact local window is checked by the script
-    - cron: "*/10 5-17 * * 1-5"
+    - cron: "*/10 5-18 * * 1-5"
   workflow_dispatch:
 
 permissions:
