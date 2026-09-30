@@ -502,7 +502,10 @@ def sheet_stamp(ws, cfg):
 
 def in_window(now, sch):
     hm = now.strftime("%H:%M")
-    return now.weekday() in sch["weekdays"] and sch["from"] <= hm <= sch["to"]
+    start, end = sch["from"], sch["to"]
+    # an end earlier than the start means the window runs past midnight
+    inside = start <= hm <= end if start <= end else (hm >= start or hm <= end)
+    return now.weekday() in sch["weekdays"] and inside
 
 
 def minutes_to_start(now, sch):
@@ -629,14 +632,11 @@ def loop(cfg, args, log):
     while time.time() < deadline:
         tick = time.time()
         now = dt.datetime.now(tz)
-        hm = now.strftime("%H:%M")
-        if not args.any_time and (now.weekday() not in sch["weekdays"] or hm > sch["to"]):
+        if not args.any_time and not in_window(now, sch):
+            if now.weekday() in sch["weekdays"] and 0 < minutes_to_start(now, sch) <= sch.get("early_minutes", 45):
+                time.sleep(30)
+                continue
             break
-        if not args.any_time and hm < sch["from"]:
-            if minutes_to_start(now, sch) > sch.get("early_minutes", 45):
-                break
-            time.sleep(30)
-            continue
         try:
             latest = latest_snapshot(ses, cfg, log)
             req = read_requests(ses, cfg)
