@@ -194,7 +194,7 @@ class RateLimited(Exception):
 def fetch_orders(cfg, status_ids):
     """All orders in the given statuses -> (orders, number of requests)."""
     api = cfg["orders_api"]
-    key = os.environ.get("ORDERS_API_KEY") or api.get("key")
+    key = (os.environ.get("ORDERS_API_KEY") or api.get("key") or "").strip()
     url = api["url"].format(domain=api["domain"])
     orders, page, calls = [], 1, 0
     while True:
@@ -204,7 +204,8 @@ def fetch_orders(cfg, status_ids):
         calls += 1
         if r.status_code == 429:
             raise RateLimited()
-        r.raise_for_status()
+        if r.status_code != 200:
+            raise RuntimeError(f"http {r.status_code}")
         j = r.json()
         data = j.get("data") or []
         orders += data
@@ -698,7 +699,8 @@ def update(cfg, ses, log, mode, latest, args):
             lines = order_lines(orders)
             log(f"Orders api: {len(orders)} orders, {len(lines)} lines, {calls} requests, {time.time() - t0:.1f}s")
         except Exception as e:
-            log.status(f"orders api skipped: {type(e).__name__}")
+            detail = str(e) if isinstance(e, RuntimeError) else ""
+            log.status(f"orders api skipped: {type(e).__name__} {detail}".rstrip())
     new_articles = []
     if lines is not None:
         new_articles = add_new_articles(sh, ws, cfg, lines, settings, write)
