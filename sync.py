@@ -101,9 +101,9 @@ def list_snapshots(drive, cfg):
     ext = cfg.get("file_ext", "").lower()
     files = [f for f in r.get("files", []) if f["name"].lower().endswith(ext)]
     for f in files:
-        f["ts"] = snapshot_time(f)
-    files = [f for f in files if f["ts"]]
-    files.sort(key=lambda f: f["ts"], reverse=True)
+        f["taken"] = snapshot_time(f)
+    files = [f for f in files if f["taken"]]
+    files.sort(key=lambda f: f["taken"], reverse=True)
     return files
 
 
@@ -380,14 +380,14 @@ def run_once(cfg, args, log):
         log.status("no snapshots")
         return
     latest = files[0]
-    log(f"Latest snapshot: {latest['ts']:%d.%m.%Y %H:%M:%S}, {int(latest['size']) / 2**20:.0f} MB")
+    log(f"Latest snapshot: {latest['taken']:%d.%m.%Y %H:%M:%S}, {int(latest['size']) / 2**20:.0f} MB")
 
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(cfg["sheet"]["id"])
     ws = sh.get_worksheet_by_id(cfg["sheet"]["gid"])
     in_sheet = sheet_stamp(ws, cfg)
     log(f"Sheet stamp: {in_sheet:%d.%m.%Y %H:%M}" if in_sheet else "Sheet stamp: none")
-    if in_sheet and latest["ts"].replace(second=0) <= in_sheet and not args.reprocess:
+    if in_sheet and latest["taken"].replace(second=0) <= in_sheet and not args.reprocess:
         log.status("up to date")
         return
     if args.check:
@@ -396,7 +396,7 @@ def run_once(cfg, args, log):
         return
 
     have = restored_time(cfg)
-    if have and abs((have - latest["ts"]).total_seconds()) < 60:
+    if have and abs((have - latest["taken"]).total_seconds()) < 60:
         log("Database already restored from this snapshot")
     else:
         bak = Path(cfg["sql"]["backup_dir"]) / "snap.bak"
@@ -416,7 +416,7 @@ def run_once(cfg, args, log):
         art = apply_row(ws, p, cfg, args.row)
         log.status(f"row {args.row} written ({art})" if art else f"row {args.row}: article not found in db")
     elif args.write:
-        apply(sh, ws, p, cfg, latest["ts"])
+        apply(sh, ws, p, cfg, latest["taken"])
         log.status("written")
     else:
         out = HERE / "reports" / f"dry-run {now:%Y%m%d-%H%M}.txt"
