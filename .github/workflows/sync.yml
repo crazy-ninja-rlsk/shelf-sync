@@ -2,10 +2,19 @@ name: sync
 
 on:
   schedule:
-    # every 10 minutes, Mon-Fri; the exact local window is checked by the script
-    - cron: "*/10 5-18 * * 1-5"
+    # every 30 minutes; the script decides whether a long polling job should run now
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "loop = long polling job, or a single update"
+        type: choice
+        options: [loop, all, stock, orders]
+        default: all
+      force:
+        description: "Update even if the snapshot is not new"
+        type: boolean
+        default: true
       any_time:
         description: "Ignore the time window"
         type: boolean
@@ -16,17 +25,21 @@ permissions:
   actions: write
 
 concurrency:
-  group: sync
+  # one long job at a time, the next scheduled one waits in the queue; manual runs do not wait for it
+  group: ${{ github.event_name == 'schedule' && 'loop' || format('manual-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 355
     env:
       CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
       GOOGLE_KEY_JSON: ${{ secrets.GOOGLE_KEY_JSON }}
+      ORDERS_API_KEY: ${{ secrets.ORDERS_API_KEY }}
+      MODE: ${{ inputs.mode || 'loop' }}
       ANY_TIME: ${{ inputs.any_time && '--any-time' || '' }}
+      FORCE: ${{ inputs.force && '--reprocess' || '' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -38,12 +51,12 @@ jobs:
       - name: deps
         run: pip install -q -r requirements.txt > /dev/null
 
-      - name: check
-        id: check
-        run: python sync.py --check $ANY_TIME
+      - name: window
+        id: window
+        run: python sync.py --window $ANY_TIME
 
       - name: server
-        if: steps.check.outputs.need == '1'
+        if: steps.window.outputs.run == '1'
         run: |
           PW="$(openssl rand -hex 16)Aa1!"
           echo "::add-mask::$PW"
@@ -60,8 +73,13 @@ jobs:
           fi
 
       - name: update
-        if: steps.check.outputs.need == '1'
-        run: python sync.py --write $ANY_TIME
+        if: steps.window.outputs.run == '1'
+        run: |
+          if [ "$MODE" = "loop" ]; then
+            python sync.py --loop --write $ANY_TIME
+          else
+            python sync.py --write --mode "$MODE" $FORCE $ANY_TIME
+          fi
 
       # scheduled workflows in inactive public repos are paused after 60 days
       - name: keepalive
