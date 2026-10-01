@@ -504,17 +504,24 @@ def daily_message(dcfg, data, snap_time, stale):
     return "\n".join(out)
 
 
-def category_lines(lines, total):
+def by_category(lines):
     cats = {}
     for l in lines:
         if l.sign > 0:
             cats[l.category] = cats.get(l.category, 0.0) + l.amount
+    return cats
+
+
+def category_lines(lines, total, prev=None):
+    cats = by_category(lines)
+    before = by_category(prev) if prev is not None else {}
     if not cats:
         return []
     out = ["", T("h_cats")]
     cats = sorted(cats.items(), key=lambda x: -x[1])
     for name, v in cats[:7]:
-        out.append(T("cat_line", name=escape(name), sum=money(v), p=f"{pct(v, total):.0f}"))
+        out.append(T("cat_line", name=escape(name), sum=money(v), p=f"{pct(v, total):.0f}")
+                   + (f" · {delta(v, before[name])}" if before.get(name) else ""))
     rest = sum(v for _, v in cats[7:])
     if rest:
         out.append(T("cat_rest", sum=money(rest)))
@@ -540,7 +547,8 @@ def weekly_message(dcfg, data):
     out.append(line)
     mt = margin_text(week)
     if mt:
-        out.append(f"💹 {mt}")
+        pm, prev_rev = margin_of(prev)
+        out.append(f"💹 {mt}" + (T("w_margin_prev", p=f"{pct(pm, prev_rev):.0f}") if prev_rev else ""))
 
     out += ["", T("h_points")]
     for p in dcfg["points"]:
@@ -558,9 +566,11 @@ def weekly_message(dcfg, data):
     per_day = [(d, sales_of(data.between(d, d + dt.timedelta(days=1)))) for d in days]
     best = max(per_day, key=lambda x: x[1])
     for d, v in per_day:
-        out.append(T("day_line", wd=wd(d), date=f"{d:%d.%m}", sum=money(v)) + (" 🏆" if d == best[0] and v else ""))
+        was = sales_of(data.between(d - dt.timedelta(days=7), d - dt.timedelta(days=6)))
+        out.append(T("day_line", wd=wd(d), date=f"{d:%d.%m}", sum=money(v)) + (" 🏆" if d == best[0] and v else "")
+                   + (T("day_prev", sum=money(was), delta=delta(v, was)) if was else ""))
 
-    out += category_lines(week, s)
+    out += category_lines(week, s, prev)
 
     top = top_lines(week)
     if top:
