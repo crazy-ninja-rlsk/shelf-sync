@@ -1,0 +1,110 @@
+name: digest
+
+on:
+  schedule:
+    # each send time gets two starts so both summer and winter time are covered; the script
+    # picks the schedule that is due and waits for its exact time, a cache entry per day and
+    # schedule stops a second message
+    - cron: "35 5,6 * * 1-5"
+    - cron: "5 14,15 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      schedule:
+        description: "Schedule from the config"
+        type: string
+        default: evening
+      chat:
+        description: "Chat key(s) from the config (empty = the schedule's own)"
+        type: string
+        default: test
+      date:
+        description: "Day YYYY-MM-DD (empty = today)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: digest-${{ github.event_name == 'schedule' && github.event.schedule || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+      DIGEST_JSON: ${{ secrets.DIGEST_JSON }}
+      GOOGLE_KEY_JSON: ${{ secrets.GOOGLE_KEY_JSON }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      BALANCE_TOKEN: ${{ secrets.BALANCE_TOKEN }}
+      MANUAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: deps
+        run: pip install -q -r requirements.txt > /dev/null
+
+      - name: window
+        id: window
+        env:
+          PICK: ${{ inputs.schedule }}
+        run: |
+          if [ -n "$MANUAL" ]; then
+            python digest.py --window --schedule "$PICK"
+          else
+            python digest.py --window
+          fi
+
+      - name: already sent
+        id: sent
+        if: steps.window.outputs.schedule != '' && env.MANUAL == ''
+        uses: actions/cache/restore@v4
+        with:
+          path: .sent
+          key: digest-sent-${{ steps.window.outputs.schedule }}-${{ steps.window.outputs.day }}
+
+      - name: server
+        if: steps.window.outputs.kind == 'digest' && steps.sent.outputs.cache-hit != 'true'
+        run: |
+          PW="$(openssl rand -hex 16)Aa1!"
+          echo "::add-mask::$PW"
+          echo "SQL_PASSWORD=$PW" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bak" && chmod 777 "$RUNNER_TEMP/bak"
+          echo "BACKUP_DIR=$RUNNER_TEMP/bak" >> "$GITHUB_ENV"
+          docker run -d --name db -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$PW" -p 1433:1433 \
+            -v "$RUNNER_TEMP/bak:/bak" mcr.microsoft.com/mssql/server:2022-latest > /dev/null
+          if ! dpkg -s msodbcsql18 > /dev/null 2>&1; then
+            curl -sSL "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb" -o /tmp/p.deb
+            sudo dpkg -i /tmp/p.deb > /dev/null
+            sudo apt-get update -qq > /dev/null
+            sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18 > /dev/null
+          fi
+          [ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ] || sudo apt-get install -y -qq fonts-dejavu-core > /dev/null
+
+      - name: send
+        if: steps.window.outputs.schedule != '' && steps.sent.outputs.cache-hit != 'true'
+        env:
+          SCHEDULE: ${{ steps.window.outputs.schedule }}
+          CHAT: ${{ inputs.chat }}
+          DAY: ${{ inputs.date }}
+        run: |
+          if [ -n "$MANUAL" ]; then
+            python digest.py --send --schedule "$SCHEDULE" ${CHAT:+--chat "$CHAT"} ${DAY:+--date "$DAY"}
+          else
+            python digest.py --send --wait --schedule "$SCHEDULE"
+          fi
+          echo ok > .sent
+
+      - name: mark sent
+        if: steps.window.outputs.schedule != '' && steps.sent.outputs.cache-hit != 'true' && env.MANUAL == ''
+        uses: actions/cache/save@v4
+        with:
+          path: .sent
+          key: digest-sent-${{ steps.window.outputs.schedule }}-${{ steps.window.outputs.day }}
