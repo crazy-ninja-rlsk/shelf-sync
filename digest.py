@@ -124,11 +124,12 @@ def hhmm(s):
 
 class Line:
     __slots__ = ("point", "check", "no", "at", "sign", "buyer", "paycat", "qty", "price", "list_price",
-                 "disc", "name", "barcode", "type_id", "good", "cost", "category", "title")
+                 "disc", "name", "barcode", "type_id", "good", "cost", "art", "category", "title")
 
     def __init__(self, r):
         (self.point, self.check, self.no, self.at, self.sign, self.buyer, self.paycat, q, p, lp, d,
-         self.name, self.barcode, self.type_id, self.good, c) = r
+         self.name, self.barcode, self.type_id, self.good, c, art) = r
+        self.art = sync.norm(art)
         self.qty, self.price = float(q or 0), float(p or 0)
         self.list_price = float(lp) if lp is not None else self.price
         self.disc = float(d or 0)
@@ -214,6 +215,9 @@ class Data:
         for l in self.hist + self.last_year:
             l.category = roots.get(l.type_id, "—")
             l.title = strip_category(l.name, prefixes)
+            if l.art:
+                # the article is shown on its own, so it is cut out of the name
+                l.title = sync.norm(re.sub(r"(?<!\S)" + re.escape(l.art) + r"(?!\S)", " ", l.title)) or l.title
             if l.cost is None and est.get(l.good):
                 l.cost = float(est[l.good])
                 if l.at and l.at >= self.d0:
@@ -254,10 +258,19 @@ def top_goods(lines, n):
     goods = {}
     for l in lines:
         if l.sign > 0:
-            g = goods.setdefault(l.title, [0.0, 0.0])
+            g = goods.setdefault((l.title, l.art), [0.0, 0.0])
             g[0] += l.qty
             g[1] += l.amount
     return sorted(goods.items(), key=lambda x: -x[1][1])[:n]
+
+
+def art(a):
+    return T("art", a=escape(a)) if a else ""
+
+
+def top_lines(lines):
+    return [T("top_line", i=i, art=art(a), name=escape(short(name, 44)), q=qty(q), sum=money(v))
+            for i, ((name, a), (q, v)) in enumerate(top_goods(lines, 5), 1)]
 
 
 def margin_text(lines):
@@ -343,6 +356,8 @@ def signals(dcfg, data, snap_time):
             first = min((l.at for l in ps if l.at), default=None)
             if first is None and now_t >= limit:
                 out.append(T("sig_none", name=name))
+                if pid in sg.get("print_always", []):
+                    out.append(T("sig_print_none", name=name))
                 continue
             if first and first.time() > limit:
                 out.append(T("sig_first", name=name, t=f"{first:%H:%M}"))
@@ -359,7 +374,9 @@ def signals(dcfg, data, snap_time):
         if pid in sg.get("print_points", []):
             pat = sg.get("print_pattern", "").casefold()
             n = len({l.check for l in ps if pat and pat in l.name.casefold()})
-            if n <= sg.get("print_min", 3):
+            if not n and pid in sg.get("print_always", []):
+                out.append(T("sig_print_none", name=name))
+            elif n <= sg.get("print_min", 3):
                 usual = [len({l.check for l in data.between(d, d + dt.timedelta(days=1), True)
                               if l.point == pid and pat in l.name.casefold()}) for d in past]
                 usual = [u for u in usual if u]
@@ -380,11 +397,12 @@ def running_low(dcfg, data):
         return [], []
     skip = {s.casefold() for s in rl.get("skip_categories", [])}
     since = data.d1 - dt.timedelta(days=rl.get("days", 30))
-    sold, title = {}, {}
+    sold, title, arts = {}, {}, {}
     for l in data.hist:
         if l.at and l.at >= since and l.sign > 0 and l.category.casefold() not in skip:
             sold[l.good] = sold.get(l.good, 0.0) + l.qty
             title[l.good] = l.title
+            arts[l.good] = l.art
     code = {p["id"]: p["code"] for p in dcfg["points"]}
     low, gone = [], []
     for g, n in sold.items():
@@ -393,7 +411,7 @@ def running_low(dcfg, data):
         per = data.stock.get(g, {})
         left = sum(per.values())
         if not left:
-            gone.append((-n, title[g], n))
+            gone.append((-n, title[g], n, arts[g]))
             continue
         days = left / (n / rl.get("days", 30))
         if days < rl.get("cover_days", 14):
@@ -401,13 +419,13 @@ def running_low(dcfg, data):
             other = sum(q for w, q in per.items() if w not in code)
             if other:
                 where.append(T("low_other", q=qty(other)))
-            low.append((days, -n, title[g], left, n, where))
+            low.append((days, -n, title[g], left, n, where, arts[g]))
     period = T("period", n=rl.get("days", 30))
-    lines_low = [T("low_line", name=escape(short(t, 42)), left=qty(left),
+    lines_low = [T("low_line", art=art(a), name=escape(short(t, 38)), left=qty(left),
                    where=f" ({', '.join(where)})" if where else "", n=qty(n), period=period)
-                 for _, _, t, left, n, where in sorted(low)[:rl.get("limit", 8)]]
-    lines_gone = [T("gone_line", name=escape(short(t, 42)), n=qty(n), period=period)
-                  for _, t, n in sorted(gone)[:rl.get("gone_limit", 5)]]
+                 for _, _, t, left, n, where, a in sorted(low)[:rl.get("limit", 8)]]
+    lines_gone = [T("gone_line", art=art(a), name=escape(short(t, 38)), n=qty(n), period=period)
+                  for _, t, n, a in sorted(gone)[:rl.get("gone_limit", 5)]]
     return lines_low, lines_gone
 
 
@@ -430,13 +448,14 @@ def daily_message(dcfg, data, snap_time, stale):
             out.append(f"💹 {mt}" + (T("margin_est") if data.estimated else ""))
     else:
         out.append(T("none"))
+    show = dict({"compare": True, "categories": True, "channels": True}, **dcfg.get("daily", {}))
     wa = day - dt.timedelta(days=7)
     wa_s = sales_of(data.between(wa, wa + dt.timedelta(days=1)))
-    if wa_s:
+    if wa_s and show["compare"]:
         out.append(T("week_ago", wd=wd(wa), date=f"{wa:%d.%m}", sum=money(wa_s), delta=delta(total, wa_s)))
     ly = day - dt.timedelta(days=364)
     ly_s = sales_of(data.last_year)
-    if ly_s:
+    if ly_s and show["compare"]:
         out.append(T("last_year", wd=wd(ly), date=f"{ly:%d.%m.%Y}", sum=money(ly_s), delta=delta(total, ly_s)))
     m0 = day.replace(day=1)
     mtd = sales_of(data.between(m0, day + dt.timedelta(days=1)))
@@ -446,7 +465,8 @@ def daily_message(dcfg, data, snap_time, stale):
     line = T("mtd", month=TX["months"][day.month - 1].capitalize(), d=day.day, sum=money(mtd))
     if prev:
         line += T("mtd_delta", delta=delta(mtd, prev))
-    out.append(line)
+    if show["compare"]:
+        out.append(line)
     if day.weekday() == 0:
         we = data.between(day - dt.timedelta(days=2), day)
         if sales_of(we):
@@ -460,33 +480,21 @@ def daily_message(dcfg, data, snap_time, stale):
     if sig:
         out += ["", T("h_signals")] + sig
 
-    cats = {}
-    for l in today:
-        if l.sign > 0:
-            cats[l.category] = cats.get(l.category, 0.0) + l.amount
-    if cats:
-        out += ["", T("h_cats")]
-        cats = sorted(cats.items(), key=lambda x: -x[1])
-        for name, v in cats[:7]:
-            out.append(T("cat_line", name=escape(name), sum=money(v), p=f"{pct(v, total):.0f}"))
-        rest = sum(v for _, v in cats[7:])
-        if rest:
-            out.append(T("cat_rest", sum=money(rest)))
+    if show["categories"]:
+        out += category_lines(today, total)
 
     channels = {}
     for l in today:
         if l.sign > 0:
             k = buyer_label(l.buyer, dcfg)
             channels[k] = channels.get(k, 0.0) + l.amount
-    if len(channels) > 1:
+    if len(channels) > 1 and show["channels"]:
         out += ["", T("h_channels"),
                 " · ".join(f"{escape(k)} {money(v)}" for k, v in sorted(channels.items(), key=lambda x: -x[1])[:6])]
 
-    top = top_goods(today, 5)
+    top = top_lines(today)
     if top:
-        out += ["", T("h_top")]
-        for i, (name, (q, v)) in enumerate(top, 1):
-            out.append(T("top_line", i=i, name=escape(short(name, 48)), q=qty(q), sum=money(v)))
+        out += ["", T("h_top")] + top
 
     low, gone = running_low(dcfg, data)
     if low:
@@ -494,6 +502,23 @@ def daily_message(dcfg, data, snap_time, stale):
     if gone:
         out += ["", T("h_gone")] + gone
     return "\n".join(out)
+
+
+def category_lines(lines, total):
+    cats = {}
+    for l in lines:
+        if l.sign > 0:
+            cats[l.category] = cats.get(l.category, 0.0) + l.amount
+    if not cats:
+        return []
+    out = ["", T("h_cats")]
+    cats = sorted(cats.items(), key=lambda x: -x[1])
+    for name, v in cats[:7]:
+        out.append(T("cat_line", name=escape(name), sum=money(v), p=f"{pct(v, total):.0f}"))
+    rest = sum(v for _, v in cats[7:])
+    if rest:
+        out.append(T("cat_rest", sum=money(rest)))
+    return out
 
 
 # ---------- weekly message ----------
@@ -535,11 +560,11 @@ def weekly_message(dcfg, data):
     for d, v in per_day:
         out.append(T("day_line", wd=wd(d), date=f"{d:%d.%m}", sum=money(v)) + (" 🏆" if d == best[0] and v else ""))
 
-    top = top_goods(week, 5)
+    out += category_lines(week, s)
+
+    top = top_lines(week)
     if top:
-        out += ["", T("h_top_week")]
-        for i, (name, (q, v)) in enumerate(top, 1):
-            out.append(T("top_line", i=i, name=escape(short(name, 48)), q=qty(q), sum=money(v)))
+        out += ["", T("h_top_week")] + top
     return "\n".join(out)
 
 
