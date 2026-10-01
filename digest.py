@@ -918,7 +918,18 @@ def main():
             texts, files = build_report(cfg, dcfg, day, log, snap_time, out_dir, weekly)
             (out_dir / f"{day:%Y.%m.%d}_message.html").write_text("\n\n----\n\n".join(texts), encoding="utf-8")
         if args.send:
-            send_all(token, resolve_chats(token, dcfg, chat_keys), texts, files, log)
+            # someone who has not started the bot yet may still do it: keep asking for a while
+            give_up = time.time() + dcfg.get("resolve_wait_minutes", 30) * 60
+            while True:
+                try:
+                    ids = resolve_chats(token, dcfg, chat_keys)
+                    break
+                except RuntimeError:
+                    if time.time() > give_up:
+                        raise
+                    log.status("recipient not reachable yet, retrying")
+                    time.sleep(120)
+            send_all(token, ids, texts, files, log)
         else:
             if not log.quiet:
                 print("\n\n----\n\n".join(texts))
