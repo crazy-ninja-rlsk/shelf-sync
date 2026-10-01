@@ -294,7 +294,7 @@ def point_block(dcfg, data, p, total):
         head += f" · {pct(s, total):.0f}%"
     if n:
         head += T("pt_checks", checks=checks_word(n), avg=money(s / n))
-    if week_ago:
+    if week_ago and dcfg.get("daily", {}).get("compare", True):
         head += f" · {delta(s, week_ago)}"
     out = [head]
 
