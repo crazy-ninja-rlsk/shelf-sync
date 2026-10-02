@@ -836,10 +836,12 @@ def poll_commands(cfg, log):
         chat = str((m.get("chat") or {}).get("id"))
         if chat not in allowed or me not in text or m.get("date", 0) < oldest:
             continue
+        log(f"chat request: {text}")
+        # a message may ask for both
+        if any(w.casefold() in text for w in cm.get("daily", [])):
+            wanted[(chat, "daily")] = True
         if any(w.casefold() in text for w in cm.get("weekly", [])):
             wanted[(chat, "weekly")] = True
-        elif any(w.casefold() in text for w in cm.get("daily", [])):
-            wanted[(chat, "daily")] = True
     if not wanted:
         return 0
     tz = ZoneInfo(dcfg["tz"])
