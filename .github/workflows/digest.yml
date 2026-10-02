@@ -39,6 +39,7 @@ jobs:
       GOOGLE_KEY_JSON: ${{ secrets.GOOGLE_KEY_JSON }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       BALANCE_TOKEN: ${{ secrets.BALANCE_TOKEN }}
+      ORDERS_API_KEY: ${{ secrets.ORDERS_API_KEY }}
       MANUAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
     steps:
       - uses: actions/checkout@v5

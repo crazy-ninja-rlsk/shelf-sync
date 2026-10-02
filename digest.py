@@ -392,6 +392,44 @@ def signals(dcfg, data, snap_time):
     return out
 
 
+def working_days_between(a, b):
+    """Working days after date a up to and including date b."""
+    n, d = 0, a
+    while d < b:
+        d += dt.timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
+def order_signals(cfg, dcfg, day, log):
+    """Orders sitting in a status too long. The api has no status change time, so the order's last change
+    is used: it is never earlier than the status change, so a hit is certain to be at least that old."""
+    rules = dcfg.get("sd_signals") or []
+    if not rules or "orders_api" not in cfg:
+        return []
+    try:
+        orders, _ = sync.fetch_orders(cfg, sorted({str(r["status"]) for r in rules}))
+    except Exception as e:
+        log.status(f"orders skipped: {type(e).__name__}")
+        return []
+    out = []
+    for r in rules:
+        old = []
+        for o in orders:
+            if str(o.get("statusId")) != str(r["status"]) or not o.get("updateAt"):
+                continue
+            changed = dt.datetime.fromisoformat(o["updateAt"]).date()
+            if working_days_between(changed, day) > r.get("working_days", 2):
+                old.append((changed, o.get("id")))
+        if old:
+            old.sort()
+            ids = ", ".join(f"№{i}" for _, i in old[:r.get("list", 10)]) + (" …" if len(old) > r.get("list", 10) else "")
+            out.append(T("sig_sd_stale", name=escape(r["name"]), days=r.get("working_days", 2), n=len(old),
+                         orders=plural(len(old), TX["orders"]), ids=ids))
+    return out
+
+
 def running_low(dcfg, data):
     rl = dcfg.get("running_low")
     if not rl:
@@ -430,7 +468,7 @@ def running_low(dcfg, data):
     return lines_low, lines_gone
 
 
-def daily_message(dcfg, data, snap_time, stale):
+def daily_message(dcfg, data, snap_time, stale, extra_signals=()):
     day = data.day
     out = [T("title", date=f"{day:%d.%m.%Y}", wd=wd(day))]
     if snap_time:
@@ -477,7 +515,7 @@ def daily_message(dcfg, data, snap_time, stale):
     for p in dcfg["points"]:
         out += point_block(dcfg, data, p, total)
 
-    sig = signals(dcfg, data, snap_time)
+    sig = signals(dcfg, data, snap_time) + list(extra_signals)
     if sig:
         out += ["", T("h_signals")] + sig
 
@@ -887,7 +925,7 @@ def build_report(cfg, dcfg, day, log, snap_time, out_dir, weekly):
     now = dt.datetime.now(tz).replace(tzinfo=None)
     stale = bool(snap_time) and day == now.date() and \
         (now - snap_time).total_seconds() > dcfg.get("stale_minutes", 60) * 60
-    texts = [daily_message(dcfg, data, snap_time, stale)]
+    texts = [daily_message(dcfg, data, snap_time, stale, order_signals(cfg, dcfg, day, log))]
     if weekly:
         texts.append(weekly_message(dcfg, data))
 
