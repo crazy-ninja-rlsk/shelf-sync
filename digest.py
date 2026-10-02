@@ -212,8 +212,9 @@ class Data:
         est.update(read_map(cn, dcfg["queries"]["costs"]))
         self.estimated = False
         prefixes = sorted(set(roots.values()), key=len, reverse=True)
+        merge = dcfg.get("category_merge", {})  # several top level categories shown as one
         for l in self.hist + self.last_year:
-            l.category = roots.get(l.type_id, "—")
+            l.category = merge.get(roots.get(l.type_id, "—"), roots.get(l.type_id, "—"))
             l.title = strip_category(l.name, prefixes)
             if l.art:
                 # the article is shown on its own, so it is cut out of the name
