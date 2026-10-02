@@ -37,6 +37,8 @@ jobs:
       CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
       GOOGLE_KEY_JSON: ${{ secrets.GOOGLE_KEY_JSON }}
       ORDERS_API_KEY: ${{ secrets.ORDERS_API_KEY }}
+      DIGEST_JSON: ${{ secrets.DIGEST_JSON }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       MODE: ${{ inputs.mode || 'loop' }}
       ANY_TIME: ${{ inputs.any_time && '--any-time' || '' }}
       FORCE: ${{ inputs.force && '--reprocess' || '' }}
@@ -71,6 +73,7 @@ jobs:
             sudo apt-get update -qq > /dev/null
             sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18 > /dev/null
           fi
+          [ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ] || sudo apt-get install -y -qq fonts-dejavu-core > /dev/null
 
       - name: update
         if: steps.window.outputs.run == '1'

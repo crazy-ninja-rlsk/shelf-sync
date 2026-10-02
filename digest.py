@@ -790,7 +790,7 @@ def resolve_chats(token, dcfg, keys):
     return list(dict.fromkeys(ids))
 
 
-def send_all(token, ids, texts, files, log):
+def send_all(token, ids, texts, files, log, exit_on_fail=True):
     failed = 0
     for chat in ids:
         try:
@@ -800,8 +800,59 @@ def send_all(token, ids, texts, files, log):
             failed += 1
             log(str(e))
     log.status(f"sent to {len(ids) - failed} of {len(ids)}")
-    if failed == len(ids):
+    if failed == len(ids) and exit_on_fail:
         sys.exit(1)
+
+
+# ---------- chat requests ----------
+
+def poll_commands(cfg, log):
+    """Requests to the bot in allowed chats ("@bot ... <keyword>") -> fresh report sent back there.
+
+    Called every minute by the long sync job; returns the number of requests answered."""
+    dcfg = load_digest_config()
+    cm = dcfg.get("commands")
+    if not cm:
+        return 0
+    TX.update(dcfg["texts"])
+    token = (os.environ.get("TELEGRAM_TOKEN") or dcfg["telegram"].get("token") or "").strip()
+    ups = tg(token, "getUpdates", data={"timeout": 0, "allowed_updates": json.dumps(["message"])})
+    if not ups:
+        return 0
+    # confirm first, so a request that breaks the report is not repeated every minute
+    tg(token, "getUpdates", data={"offset": ups[-1]["update_id"] + 1, "timeout": 0,
+                                 "allowed_updates": json.dumps(["message"])})
+    me = "@" + tg(token, "getMe")["username"].casefold()
+    allowed = {}
+    for k in cm["chats"]:
+        v = dcfg["telegram"]["chats"][k]
+        for c in v if isinstance(v, list) else [v]:
+            allowed[str(c)] = k
+    oldest = time.time() - cm.get("max_age_minutes", 15) * 60
+    wanted = {}
+    for u in ups:
+        m = u.get("message") or {}
+        text = (m.get("text") or "").casefold()
+        chat = str((m.get("chat") or {}).get("id"))
+        if chat not in allowed or me not in text or m.get("date", 0) < oldest:
+            continue
+        if any(w.casefold() in text for w in cm.get("weekly", [])):
+            wanted[(chat, "weekly")] = True
+        elif any(w.casefold() in text for w in cm.get("daily", [])):
+            wanted[(chat, "daily")] = True
+    if not wanted:
+        return 0
+    tz = ZoneInfo(dcfg["tz"])
+    snap_time = prepare_db(cfg, log, True)
+    day = dt.datetime.now(tz).date()
+    texts, files = build_report(cfg, dcfg, day, log, snap_time, HERE / "reports" / "digest", True)
+    for chat, kind in wanted:
+        if kind == "weekly":
+            send_all(token, [chat], texts[1:], [], log, exit_on_fail=False)
+        else:
+            send_all(token, [chat], texts[:1], files, log, exit_on_fail=False)
+        log.status(f"chat request answered: {kind}")
+    return len(wanted)
 
 
 # ---------- main ----------
@@ -874,6 +925,7 @@ def main():
     ap.add_argument("--wait", action="store_true", help="wait until the schedule's send time")
     ap.add_argument("--window", action="store_true", help="only tell which schedule is due now")
     ap.add_argument("--chats", action="store_true", help="list chats the bot can see")
+    ap.add_argument("--commands", action="store_true", help="answer pending chat requests once")
     args = ap.parse_args()
 
     dcfg = load_digest_config()
@@ -885,6 +937,11 @@ def main():
     if args.chats:
         for cid, (kind, title, user) in list_chats(token).items():
             print(cid, kind, title, f"@{user}" if user else "")
+        return
+
+    if args.commands:
+        cfg = sync.load_config()
+        log.status(f"answered: {poll_commands(cfg, log)}")
         return
 
     now = dt.datetime.now(tz)

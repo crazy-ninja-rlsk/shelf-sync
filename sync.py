@@ -661,6 +661,13 @@ def loop(cfg, args, log):
                 ses = Session(cfg)
             except Exception:
                 pass
+        # report requests written to the chat bot are answered from the db this job keeps up to date
+        if os.environ.get("DIGEST_JSON"):
+            try:
+                import digest
+                digest.poll_commands(cfg, log)
+            except Exception as e:
+                log.status(f"{now:%H:%M} chat requests failed: {type(e).__name__}")
         time.sleep(max(5, 60 - (time.time() - tick)))
     log.status("loop finished")
 
