@@ -3,3 +3,5 @@ config.local.json
 reports/
 __pycache__/
 *.bak
+buyer_cache/
+restock_cache/

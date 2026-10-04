@@ -667,6 +667,13 @@ def loop(cfg, args, log):
                             hook.send(ses.sh, getattr(ses, "orders", None))
                         except Exception as e:
                             log.status(f"{now:%H:%M} chat note failed: {type(e).__name__}")
+                    # restock proposals follow every fresh stock update (sales are re-read once a day)
+                    if stock and os.environ.get("RESTOCK_JSON"):
+                        try:
+                            import restock
+                            restock.run_all(cfg, log=log.status)
+                        except Exception as e:
+                            log.status(f"{now:%H:%M} restock failed: {type(e).__name__}")
                 finally:
                     clear_requests(ses, cfg, [w for w in ("orders", "stock") if req.get(w)])
         except Exception as e:
