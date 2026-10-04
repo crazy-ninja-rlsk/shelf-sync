@@ -7,7 +7,6 @@ on:
     # schedule stops a second message
     - cron: "35 5,6 * * 1-5"
     - cron: "5 14,15 * * 1-5"
-    - cron: "5 11,12 * * *"
   workflow_dispatch:
     inputs:
       schedule:
