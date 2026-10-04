@@ -818,7 +818,8 @@ def branch_message(cfg, dcfg, now, log):
         back = dt.date.fromisoformat(x["DateReturnCargo"]) if x.get("DateReturnCargo") else None
         o = by_ttn[n]
         name = managers.get(o.get("userId")) or T("no_manager")
-        waiting.append((days, re.sub(r"\s*\(.*$", "", name), o["id"], cod, back))
+        name = re.sub(r"\s*\(.*$", "", name)
+        waiting.append((days, dcfg.get("manager_names", {}).get(name, name), o["id"], cod, back))
 
     out = [T("br_title", date=f"{today:%d.%m}", t=f"{now:%H:%M}"), ""]
     first = [w for w in waiting if 1 <= w[0] <= b["group_max"]]
