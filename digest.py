@@ -753,6 +753,102 @@ def balance_message(dcfg, now, log):
         return T("balance_na", **stamp)
 
 
+# ---------- parcels waiting at the carrier's branch ----------
+
+def order_meta(cfg):
+    """Option lists of the order fields (status, manager, ...) from the orders api."""
+    api = cfg["orders_api"]
+    key = (os.environ.get("ORDERS_API_KEY") or api.get("key") or "").strip()
+    r = requests.get(api["url"].format(domain=api["domain"]), params={"page": 1, "limit": 1},
+                     headers={api["key_header"]: key}, timeout=60)
+    return r.json()["meta"]["fields"]
+
+
+def deliveries(o):
+    v = o.get("ord_delivery_data") or []
+    out = []
+    for x in v if isinstance(v, list) else [v]:
+        if isinstance(x, list):
+            out += [y for y in x if isinstance(y, dict)]
+        elif isinstance(x, dict):
+            out.append(x)
+    return out
+
+
+def track(dcfg, numbers):
+    """Carrier tracking for many waybills -> {number: record}. Read only."""
+    np_cfg = dcfg["np"]
+    key = (os.environ.get("NP_KEY") or np_cfg.get("key") or "").strip()
+    out = {}
+    for i in range(0, len(numbers), 100):
+        r = requests.post(np_cfg["url"], timeout=60, json={
+            "apiKey": key, "modelName": "TrackingDocument", "calledMethod": "getStatusDocuments",
+            "methodProperties": {"Documents": [{"DocumentNumber": n, "Phone": ""} for n in numbers[i:i + 100]]}})
+        for x in r.json().get("data") or []:
+            out[str(x.get("Number"))] = x
+    return out
+
+
+def branch_message(cfg, dcfg, now, log):
+    """Parcels lying at the branch: short count for the first days, then order numbers by manager."""
+    b = dcfg["branch"]
+    orders, _ = sync.fetch_orders(cfg, [str(b["status"])])
+    managers = {o["value"]: o["text"] for o in (order_meta(cfg).get("userId") or {}).get("options") or []}
+    by_ttn = {}
+    for o in orders:
+        changed = o.get("updateAt")
+        if changed and (now.replace(tzinfo=None) - dt.datetime.fromisoformat(changed)).days > b.get("stale_days", 30):
+            continue  # long forgotten orders are reviewed separately
+        for x in deliveries(o):
+            if x.get("trackingNumber"):
+                by_ttn[str(x["trackingNumber"])] = o
+    info = track(dcfg, list(by_ttn))
+    today = now.date()
+    waiting = []
+    for n, x in info.items():
+        if str(x.get("StatusCode")) not in b["np_branch_codes"] or not x.get("ActualDeliveryDate"):
+            continue
+        days = (today - dt.datetime.fromisoformat(x["ActualDeliveryDate"]).date()).days
+        cod = float(x.get("AfterpaymentOnGoodsCost") or 0)
+        back = dt.date.fromisoformat(x["DateReturnCargo"]) if x.get("DateReturnCargo") else None
+        o = by_ttn[n]
+        name = managers.get(o.get("userId")) or T("no_manager")
+        waiting.append((days, re.sub(r"\s*\(.*$", "", name), o["id"], cod, back))
+
+    out = [T("br_title", date=f"{today:%d.%m}", t=f"{now:%H:%M}"), ""]
+    first = [w for w in waiting if 1 <= w[0] <= b["group_max"]]
+    if first:
+        out.append(T("br_group", d=b["group_max"], n=len(first), cod=sum(1 for w in first if w[3]),
+                     paid=sum(1 for w in first if not w[3])))
+    bounds = b["buckets"]
+    shown = False
+    for i, lo in enumerate(bounds):
+        hi = bounds[i + 1] if i + 1 < len(bounds) else None
+        group = [w for w in waiting if w[0] >= lo and (hi is None or w[0] < hi)]
+        if not group:
+            continue
+        shown = True
+        out += ["", T("br_bucket", label=TX["br_labels"][i], n=len(group))]
+        per = {}
+        for w in sorted(group, key=lambda w: (-w[0], w[2])):
+            per.setdefault(w[1], []).append(w)
+        for name, items in per.items():
+            out.append(T("br_manager", name=escape(name)))
+            for days, _, oid, cod, back in items:
+                if back == today:
+                    ret = T("br_ret_today")
+                elif back == today + dt.timedelta(days=1):
+                    ret = T("br_ret_tomorrow")
+                else:
+                    ret = T("br_ret", date=f"{back:%d.%m}") if back else ""
+                out.append(T("br_line", id=oid, days=T("br_line_days", d=days) if hi is None else "",
+                             pay=T("br_cod", sum=money(cod)) if cod else T("br_paid"), ret=ret).rstrip(" ·"))
+    if not shown:
+        out += ["", T("br_none")]
+    log(f"Parcels at branch: {len(waiting)}")
+    return "\n".join(out)
+
+
 # ---------- telegram ----------
 
 def tg(token, method, **kw):
@@ -948,7 +1044,7 @@ def due_schedule(dcfg, now):
             continue
         at = dt.datetime.combine(now.date(), hhmm(s["at"]), tzinfo=now.tzinfo)
         if at - dt.timedelta(minutes=dcfg.get("window_before", 60)) <= now <= \
-                at + dt.timedelta(minutes=dcfg.get("window_after", 180)):
+                at + dt.timedelta(minutes=s.get("window_after", dcfg.get("window_after", 180))):
             return name
     return None
 
@@ -960,6 +1056,7 @@ def main():
     ap.add_argument("--date", help="YYYY-MM-DD, default today")
     ap.add_argument("--weekly", action="store_true", help="add the weekly summary on any day")
     ap.add_argument("--balance", action="store_true", help="the balance note instead of the digest")
+    ap.add_argument("--branch", action="store_true", help="the parcels-at-branch note instead of the digest")
     ap.add_argument("--schedule", help="run a schedule from the config (its kind, chat and time)")
     ap.add_argument("--no-restore", action="store_true")
     ap.add_argument("--wait", action="store_true", help="wait until the schedule's send time")
@@ -995,7 +1092,7 @@ def main():
         return
 
     sch = dcfg["schedules"][args.schedule] if args.schedule else {}
-    kind = "balance" if args.balance else sch.get("kind", "digest")
+    kind = "balance" if args.balance else ("branch" if args.branch else sch.get("kind", "digest"))
     chat_keys = args.chat or sch.get("chat") or dcfg["telegram"]["chat"]
 
     def wait_until(target):
@@ -1006,7 +1103,11 @@ def main():
 
     try:
         send_at = dt.datetime.combine(now.date(), hhmm(sch["at"]), tzinfo=tz) if sch else now
-        if kind == "balance":
+        if kind == "branch":
+            if args.wait:
+                wait_until(send_at)
+            texts, files = [branch_message(sync.load_config(), dcfg, dt.datetime.now(tz), log)], []
+        elif kind == "balance":
             if args.wait:
                 wait_until(send_at)
             texts, files = [balance_message(dcfg, dt.datetime.now(tz), log)], []

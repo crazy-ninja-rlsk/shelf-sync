@@ -7,6 +7,7 @@ on:
     # schedule stops a second message
     - cron: "35 5,6 * * 1-5"
     - cron: "5 14,15 * * 1-5"
+    - cron: "5 11,12 * * *"
   workflow_dispatch:
     inputs:
       schedule:
@@ -40,6 +41,7 @@ jobs:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       BALANCE_TOKEN: ${{ secrets.BALANCE_TOKEN }}
       ORDERS_API_KEY: ${{ secrets.ORDERS_API_KEY }}
+      NP_KEY: ${{ secrets.NP_KEY }}
       MANUAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
     steps:
       - uses: actions/checkout@v5
