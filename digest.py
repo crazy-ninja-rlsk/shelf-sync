@@ -794,11 +794,18 @@ def track(dcfg, numbers):
     return out
 
 
-def branch_message(cfg, dcfg, now, log):
-    """Parcels lying at the branch: short count for the first days, then order numbers by manager."""
+_MANAGERS = {}
+
+
+def branch_message(cfg, dcfg, now, log, orders=None):
+    """Parcels lying at the branch for a while, by manager. `orders` = already fetched orders (any statuses)."""
     b = dcfg["branch"]
-    orders, _ = sync.fetch_orders(cfg, [str(b["status"])])
-    managers = {o["value"]: o["text"] for o in (order_meta(cfg).get("userId") or {}).get("options") or []}
+    if orders is None:
+        orders, _ = sync.fetch_orders(cfg, [str(b["status"])])
+    orders = [o for o in orders if str(o.get("statusId")) == str(b["status"])]
+    if not _MANAGERS:
+        _MANAGERS.update({o["value"]: o["text"] for o in (order_meta(cfg).get("userId") or {}).get("options") or []})
+    managers = _MANAGERS
     by_ttn = {}
     for o in orders:
         changed = o.get("updateAt")
@@ -821,11 +828,11 @@ def branch_message(cfg, dcfg, now, log):
         name = re.sub(r"\s*\(.*$", "", name)
         waiting.append((days, dcfg.get("manager_names", {}).get(name, name), o["id"], cod, back))
 
-    out = [T("br_title", date=f"{today:%d.%m}", t=f"{now:%H:%M}"), ""]
-    first = [w for w in waiting if 1 <= w[0] <= b["group_max"]]
+    out = [T("br_title", date=f"{today:%d.%m}", t=f"{now:%H:%M}")]
+    first = [w for w in waiting if 1 <= w[0] <= b.get("group_max", 0)]
     if first:
-        out.append(T("br_group", d=b["group_max"], n=len(first), cod=sum(1 for w in first if w[3]),
-                     paid=sum(1 for w in first if not w[3])))
+        out += ["", T("br_group", d=b["group_max"], n=len(first), cod=sum(1 for w in first if w[3]),
+                           paid=sum(1 for w in first if not w[3]))]
     bounds = b["buckets"]
     shown = False
     for i, lo in enumerate(bounds):
@@ -853,6 +860,43 @@ def branch_message(cfg, dcfg, now, log):
         out += ["", T("br_none")]
     log(f"Parcels at branch: {len(waiting)}")
     return "\n".join(out)
+
+
+class SyncHook:
+    """Chat notes sent by the long sync job right after a stock update, once a day after their time.
+    The day of the last send is kept in a sheet cell, so a restarted job does not repeat it."""
+
+    def __init__(self, cfg, log):
+        self.cfg, self.log = cfg, log
+        self.dcfg = load_digest_config()
+        TX.update(self.dcfg["texts"])
+        self.tz = ZoneInfo(self.dcfg["tz"])
+        self.sch = next(((k, s) for k, s in self.dcfg["schedules"].items() if s.get("in_sync")), None)
+
+    def due(self, sh):
+        if not self.sch:
+            return False
+        _, s = self.sch
+        now = dt.datetime.now(self.tz)
+        if now.weekday() not in s["weekdays"] or now.time() < hhmm(s["at"]):
+            return False
+        if s.get("from") and now.date().isoformat() < s["from"]:
+            return False
+        tab, cell = s["sent_cell"].split("!")
+        return (sh.worksheet(tab).acell(cell).value or "").strip() != now.date().isoformat()
+
+    def statuses(self):
+        return [self.dcfg["branch"]["status"]] if self.sch else []
+
+    def send(self, sh, orders):
+        name, s = self.sch
+        now = dt.datetime.now(self.tz)
+        text = branch_message(self.cfg, self.dcfg, now, self.log, orders)
+        token = (os.environ.get("TELEGRAM_TOKEN") or self.dcfg["telegram"].get("token") or "").strip()
+        send_all(token, resolve_chats(token, self.dcfg, s["chat"]), [text], [], self.log, exit_on_fail=False)
+        tab, cell = s["sent_cell"].split("!")
+        sh.worksheet(tab).update_acell(cell, now.date().isoformat())
+        self.log.status(f"{now:%H:%M} chat note sent: {name}")
 
 
 # ---------- telegram ----------
@@ -1046,6 +1090,8 @@ def build_report(cfg, dcfg, day, log, snap_time, out_dir, weekly):
 def due_schedule(dcfg, now):
     """Name of the schedule whose window (send time minus/plus a margin) contains now, or None."""
     for name, s in dcfg["schedules"].items():
+        if s.get("in_sync"):
+            continue  # sent by the sync job
         if now.weekday() not in s["weekdays"] or (s.get("from") and now.date().isoformat() < s["from"]):
             continue
         at = dt.datetime.combine(now.date(), hhmm(s["at"]), tzinfo=now.tzinfo)

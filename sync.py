@@ -628,6 +628,11 @@ def loop(cfg, args, log):
     deadline = time.time() + (args.minutes or sch.get("max_minutes", 340)) * 60
     ses = Session(cfg)
     done = sheet_stamp(ses.ws, cfg)
+    # chat notes that go out together with a stock update (their settings come from the digest config)
+    hook = None
+    if os.environ.get("DIGEST_JSON"):
+        import digest
+        hook = digest.SyncHook(cfg, log)
     log.status("loop started")
     while time.time() < deadline:
         tick = time.time()
@@ -645,11 +650,23 @@ def loop(cfg, args, log):
             orders = new or req.get("orders")
             if stock or orders:
                 mode = "all" if stock and orders else ("stock" if stock else "orders")
+                note = False
+                if hook and new:
+                    try:
+                        note = hook.due(ses.sh)
+                    except Exception as e:
+                        log.status(f"{now:%H:%M} chat note check failed: {type(e).__name__}")
+                args.extra_statuses = hook.statuses() if note else []
                 try:
                     update(cfg, ses, log, mode, latest, args)
                     if stock:
                         done = latest["taken"].replace(second=0)
                     log.status(f"{now:%H:%M} updated: {mode}" + (" (new snapshot)" if new else " (request)"))
+                    if note:
+                        try:
+                            hook.send(ses.sh, getattr(ses, "orders", None))
+                        except Exception as e:
+                            log.status(f"{now:%H:%M} chat note failed: {type(e).__name__}")
                 finally:
                     clear_requests(ses, cfg, [w for w in ("orders", "stock") if req.get(w)])
         except Exception as e:
@@ -662,9 +679,8 @@ def loop(cfg, args, log):
             except Exception:
                 pass
         # report requests written to the chat bot are answered from the db this job keeps up to date
-        if os.environ.get("DIGEST_JSON"):
+        if hook:
             try:
-                import digest
                 digest.poll_commands(cfg, log)
             except Exception as e:
                 log.status(f"{now:%H:%M} chat requests failed: {type(e).__name__}")
@@ -698,11 +714,15 @@ def update(cfg, ses, log, mode, latest, args):
     # orders from the api: new articles first, because inserting rows shifts everything below
     settings = read_settings(sh, cfg) if do_orders and "settings" in cfg else None
     lines = None
+    ses.orders = None
     if settings and "orders_api" in cfg:
-        ids = sorted({i for v in settings["api_columns"].values() for i in v} | set(settings["new_articles"]), key=int)
+        ids = {i for v in settings["api_columns"].values() for i in v} | set(settings["new_articles"])
+        # statuses another consumer needs ride along in the same requests instead of separate ones
+        ids = sorted(ids | {str(i) for i in getattr(args, "extra_statuses", [])}, key=int)
         t0 = time.time()
         try:
             orders, calls = fetch_orders(cfg, ids)
+            ses.orders = orders
             lines = order_lines(orders)
             log(f"Orders api: {len(orders)} orders, {len(lines)} lines, {calls} requests, {time.time() - t0:.1f}s")
         except Exception as e:
