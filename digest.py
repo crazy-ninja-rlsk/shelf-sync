@@ -759,9 +759,14 @@ def order_meta(cfg):
     """Option lists of the order fields (status, manager, ...) from the orders api."""
     api = cfg["orders_api"]
     key = (os.environ.get("ORDERS_API_KEY") or api.get("key") or "").strip()
-    r = requests.get(api["url"].format(domain=api["domain"]), params={"page": 1, "limit": 1},
-                     headers={api["key_header"]: key}, timeout=60)
-    return r.json()["meta"]["fields"]
+    for attempt in range(5):
+        # the api limits the request rate, so a refusal is waited out
+        time.sleep(api.get("pause", 1.5) * (attempt + 1) * 2)
+        r = requests.get(api["url"].format(domain=api["domain"]), params={"page": 1, "limit": 1},
+                         headers={api["key_header"]: key}, timeout=60)
+        if r.status_code == 200 and "meta" in r.json():
+            return r.json()["meta"]["fields"]
+    return {}
 
 
 def deliveries(o):
