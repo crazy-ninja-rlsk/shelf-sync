@@ -114,7 +114,7 @@ def cache_dir():
 
 
 def feed_prices():
-    """Prices by item code from the shop feed, downloaded at most once a day."""
+    """{item code: (price, name, supplier code)} from the shop feed, downloaded at most once a day."""
     f = os.path.join(cache_dir(), f"feed_{dt.date.today():%Y-%m-%d}.xml")
     if not os.path.exists(f):
         r = requests.get(R["feed"], timeout=180); r.raise_for_status()
@@ -122,7 +122,8 @@ def feed_prices():
     out = {}
     for o in ET.parse(f).getroot().iter("offer"):
         m = (o.findtext("model") or "").strip()
-        if m: out[m.lower()] = (o.findtext("price") or "").strip()
+        if m: out[m.lower()] = ((o.findtext("price") or "").strip(), " ".join((o.findtext("name") or "").split()),
+                                " ".join((o.findtext("source_sku") or "").split()))
     return out
 
 
@@ -229,7 +230,8 @@ def build():
         for o in lineage(a):
             for d, q in own.get(o, {}).items(): daily[a][d] = daily[a].get(d, 0.0) + q
     dbstock = db_stock(cfg, PFXS)
-    price = c["prices"]
+    feed = c["prices"]
+    price = {a: x[0] for a, x in feed.items()}
     tot = lambda a, d0, d1: sum(q for d, q in daily[a].items() if d0 <= d < d1)
     dd = lambda x: f"{x:%d.%m}"
     out = []
@@ -277,7 +279,7 @@ def build():
         head = [T("proposed", d=first.get(a, dd(today))), T("updated", d=dd(today))]
         if not (E or F or season_only):
             if a in bot:
-                out.append(dict(a=case.get(a, a), name="", E=0, F=0, D=0, G=price.get(a, ""), rows=bot[a],
+                out.append(dict(a=case.get(a, a), name="", E=0, F=0, D=0, G=price.get(a, ""), rows=bot[a], sku=feed.get(a, ("", "", ""))[2],
                                 why="; ".join(head + [basis, T("plan", m=f"{m:g}"), T("not_needed")])))
             continue
         if a in problem: continue
@@ -293,10 +295,12 @@ def build():
         if prow: why.append(T("pending", rows=", ".join(map(str, prow))))
         if took: why.append(T("took_short", took=took, n=E + F))
         why.append(T("order", n=E + F) if E + F else T("review"))
-        nm = names.get(a) or sync.norm(sync.norm(dbname.get(a, "") or sheetname.get(a, "")).replace(case.get(a, a), "").replace(TAB, ""))
+        # the name: from the order sheet, else from the shop feed, else from the database
+        nm = names.get(a) or feed.get(a, ("", "", ""))[1] or             sync.norm(sync.norm(dbname.get(a, "") or sheetname.get(a, "")).replace(case.get(a, a), "").replace(TAB, ""))
         for p in R.get("name_strip", []):
             nm = re.sub(r"^(" + re.escape(p) + r"\s+)+", "", nm)
         out.append(dict(a=case.get(a, a), name=nm, E=E, F=F, D=E + F, G=price.get(a, ""), why="; ".join(head + why),
+                        sku=feed.get(a, ("", "", ""))[2],
                         rows=bot.get(a, []), hint=season_only))
     out.sort(key=lambda r: (r.get("hint", False), -r["F"], -r["D"]))
     return out
@@ -320,6 +324,7 @@ def write(out, dry=False):
     last_any, last_mgr, _ = layout(vals)
     nxt = max(last_any + 1, last_mgr + GAP + 1)
     data = []; log = []; gone_rows = []
+    raw = []   # written as typed text, so codes like 0433 keep their leading zero
     today = dt.date.today()
     stamp = float(f"{today.day}.{today.month:02d}")   # dates in column K are typed as numbers like 28.09
     for r in out:
@@ -331,6 +336,8 @@ def write(out, dry=False):
         if rows:
             n = rows[0]
             data.append({"range": f"D{n}:G{n}", "values": [[f"=F{n}+E{n}", r["E"] or "", r["F"] or "", price]]})
+            if r.get("sku"):
+                raw.append({"range": f"C{n}", "values": [[r["sku"]]]})   # supplier's own code, when the feed knows it
             data.append({"range": f"K{n}:N{n}", "values": [[stamp, "", "", r["why"]]]})
             log.append((n, "updated"))
             for extra in rows[1:]:
@@ -339,6 +346,8 @@ def write(out, dry=False):
                 log.append((extra, "zeroed"))
         elif r["D"] or r.get("hint"):
             n = nxt; nxt += 1
+            if r.get("sku"):
+                raw.append({"range": f"C{n}", "values": [[r["sku"]]]})
             data.append({"range": f"A{n}:N{n}", "values": [[r["a"], r["name"], "", f"=F{n}+E{n}", r["E"] or "", r["F"] or "", price,
                                                             "", "", R["statuses"]["bot_value"], stamp, "", "", r["why"]]]})
             log.append((n, "new"))
@@ -358,6 +367,8 @@ def write(out, dry=False):
         c["book"].batch_update({"requests": reqs})
     if data:
         ws.batch_update(data, value_input_option="USER_ENTERED")
+    if raw:
+        ws.batch_update(raw, value_input_option="RAW")
     if gone_rows:
         c["book"].batch_update({"requests": [{"deleteDimension": {"range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": n - 1, "endIndex": n}}}
                                              for n in sorted(set(gone_rows), reverse=True)]})
