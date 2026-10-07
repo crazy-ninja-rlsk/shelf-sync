@@ -56,17 +56,50 @@ def db_connect():
     return cn, d.get("prefix", "")
 
 
-def load_shop(cn, p, goods, links):
-    days, lang = M["days_field"], int(M["lang"])
-    with cn.cursor() as cur:
-        cur.execute(f"SELECT product_id id, model, status, quantity, price, {days} days FROM {p}product")
-        prods = cur.fetchall()
+_CAT = {}   # catalogue read once per snapshot and shared with the restock module
+
+
+def catalogue(cfg):
+    """All shop items (short columns + name + supplier code), read at most once per restored snapshot."""
+    if not M:
+        load_config()
+    stamp = sync.restored_time(cfg)
+    if _CAT.get("stamp") != stamp or "rows" not in _CAT:
+        days, lang = M["days_field"], int(M["lang"])
+        cn, p = db_connect()
+        try:
+            with cn.cursor() as cur:
+                cur.execute(f"SELECT i.product_id id, i.model, i.status, i.quantity, i.price, i.{days} days, "
+                            f"i.source_sku sku, d.name FROM {p}product i LEFT JOIN {p}product_description d "
+                            f"ON d.product_id = i.product_id AND d.language_id = {lang}")
+                _CAT.update(stamp=stamp, rows=cur.fetchall())
+        finally:
+            cn.close()
+    return [dict(r) for r in _CAT["rows"]]
+
+
+def prices(cfg):
+    """{code: (price, name, supplier code)} in the shape the restock module used to take from the price feed."""
+    out = {}
+    for r in catalogue(cfg):
+        m = str(r["model"] or "").strip()
+        if m and m.lower() not in out:
+            pr = float(r["price"] or 0)
+            out[m.lower()] = (f"{pr:g}" if pr else "0", " ".join(str(r["name"] or "").split()),
+                              " ".join(str(r["sku"] or "").split()))
+    return out
+
+
+def load_shop(cn, p, goods, links, cfg):
+    lang = int(M["lang"])
+    prods = catalogue(cfg)
     shop = defaultdict(list)  # code -> items (a code may be there twice)
     for r in sorted(prods, key=lambda r: (-int(r["status"]), r["id"])):
         k = key(r["model"])
         if k:
             r["model"] = " ".join(str(r["model"]).split())
-            r["name"], r["values"], r["option_ids"] = "", {}, set()
+            r["name"] = " ".join(str(r["name"] or "").split())
+            r["values"], r["option_ids"] = {}, set()
             shop[k].append(r)
     mark = M["mark"].casefold()
     want = {shop_code(g["code"], shop) for g in goods if g["family"]} | {a for a, _v in links.values()} \
@@ -255,7 +288,7 @@ def plan(goods, shop, dictionary, terms, links, skip):
                 changes.append(("product", r["id"], "quantity", r["quantity"], total, r["model"], "quantity"))
             want = 1 if max(total, total_by_code.get(a, 0)) > 0 else 0
             if want == 1 and r["status"] == 0 and not r["has_price"]:
-                problems.append((T["zero_price"], r["model"], "", "", total, ""))
+                problems.append((T["zero_price"], r["model"], r["name"], "", total, ""))
             elif want != r["status"]:
                 changes.append(("product", r["id"], "status", r["status"], want, r["model"], "status"))
 
@@ -285,7 +318,7 @@ def plan(goods, shop, dictionary, terms, links, skip):
                              "; ".join(f"{l}: {q:g}" for l, q in sorted(g["negative"].items()))))
     for a, items in shop.items():
         if sum(1 for r in items if r["status"] == 1) > 1:
-            problems.append((T["duplicate"], items[0]["model"], "", "", "", ""))
+            problems.append((T["duplicate"], items[0]["model"], items[0]["name"], "", "", ""))
     problems = [e for e in problems if not (e[1] and skipped(key(e[1]), skip))]
     return changes, problems
 
@@ -381,7 +414,7 @@ def run(cfg, log=print, write=None, force=False):
     goods = read_goods(cfg, places(cfg, gc))
     cn, p = db_connect()
     try:
-        shop, dictionary = load_shop(cn, p, goods, links)
+        shop, dictionary = load_shop(cn, p, goods, links, cfg)
         g = M["guards"]
         stop = []
         if not taken or (now - taken).total_seconds() > g["max_snapshot_age_hours"] * 3600:

@@ -103,7 +103,7 @@ def load(cfg, refresh=False):
     ws = gc.open_by_key(cfg["sheet"]["id"]).get_worksheet_by_id(cfg["sheet"]["gid"])
     stock_rows = ws.get(f"A6:P{ws.row_count}", value_render_option="UNFORMATTED_VALUE")
     _C.update(cfg=cfg, book=book, sheets=sheets, tabs=tabs, lists=lists, cells=cells,
-              template=next(iter(cells.values()), None), stock_rows=stock_rows, prices=feed_prices(), sales=None)
+              template=next(iter(cells.values()), None), stock_rows=stock_rows, prices=shop_prices(cfg), sales=None)
     return _C
 
 
@@ -111,6 +111,18 @@ def cache_dir():
     d = os.environ.get("RESTOCK_CACHE") or os.path.join(HERE, "restock_cache")
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def shop_prices(cfg):
+    """Live prices, names and supplier codes from the shop database (shared read with the mirror module);
+    the price feed is only a fallback when that is not configured or fails."""
+    if os.environ.get("MIRROR_JSON") or os.path.exists(os.path.join(HERE, "mirror.local.json")):
+        try:
+            import mirror
+            return mirror.prices(cfg)
+        except Exception:
+            pass
+    return feed_prices()
 
 
 def feed_prices():
