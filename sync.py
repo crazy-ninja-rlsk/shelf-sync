@@ -603,6 +603,9 @@ def run_once(cfg, args, log):
         log.status("new snapshot")
         return
     update(cfg, ses, log, args.mode, latest, args)
+    if args.mode in ("all", "stock") and os.environ.get("MIRROR_JSON"):
+        import mirror
+        mirror.run(cfg, log=log.status, force=args.reprocess)
 
 
 def read_requests(ses, cfg):
@@ -674,6 +677,13 @@ def loop(cfg, args, log):
                             restock.run_all(cfg, log=log.status)
                         except Exception as e:
                             log.status(f"{now:%H:%M} restock failed: {type(e).__name__}")
+                    # the shop mirror follows every fresh snapshot too
+                    if stock and os.environ.get("MIRROR_JSON"):
+                        try:
+                            import mirror
+                            mirror.run(cfg, log=log.status)
+                        except Exception as e:
+                            log.status(f"{now:%H:%M} mirror failed: {type(e).__name__}")
                 finally:
                     clear_requests(ses, cfg, [w for w in ("orders", "stock") if req.get(w)])
         except Exception as e:

@@ -41,6 +41,7 @@ jobs:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       NP_KEY: ${{ secrets.NP_KEY }}
       RESTOCK_JSON: ${{ secrets.RESTOCK_JSON }}
+      MIRROR_JSON: ${{ secrets.MIRROR_JSON }}
       MODE: ${{ inputs.mode || 'loop' }}
       ANY_TIME: ${{ inputs.any_time && '--any-time' || '' }}
       FORCE: ${{ inputs.force && '--reprocess' || '' }}

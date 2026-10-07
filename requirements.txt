@@ -5,3 +5,4 @@ pyodbc
 requests
 tzdata
 reportlab
+pymysql
