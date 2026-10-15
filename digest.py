@@ -863,27 +863,27 @@ def branch_message(cfg, dcfg, now, log, orders=None):
 
 
 class SyncHook:
-    """Chat notes sent by the long sync job right after a stock update, once a day after their time.
-    The day of the last send is kept in a sheet cell, so a restarted job does not repeat it."""
+    """Chat notes sent by the long sync job once a day after their time: the parcels note goes out with
+    a stock update, notes with "every_tick" are checked every minute. The day of the last send is kept
+    in a sheet cell, so a restarted job (or the digest workflow as a fallback) does not repeat it."""
 
     def __init__(self, cfg, log):
         self.cfg, self.log = cfg, log
         self.dcfg = load_digest_config()
         TX.update(self.dcfg["texts"])
         self.tz = ZoneInfo(self.dcfg["tz"])
-        self.sch = next(((k, s) for k, s in self.dcfg["schedules"].items() if s.get("in_sync")), None)
+        self.schs = [(k, s) for k, s in self.dcfg["schedules"].items() if s.get("in_sync")]
+        self.sch = next(((k, s) for k, s in self.schs if not s.get("every_tick")), None)
+
+    def is_due(self, sh, s):
+        now = dt.datetime.now(self.tz)
+        # no end of the window unless the schedule sets one
+        if not in_send_window(self.dcfg, s, now, before=0, after=s.get("window_after", 24 * 60)):
+            return False
+        return not sent_today(sh, s, now)
 
     def due(self, sh):
-        if not self.sch:
-            return False
-        _, s = self.sch
-        now = dt.datetime.now(self.tz)
-        if now.weekday() not in s["weekdays"] or now.time() < hhmm(s["at"]):
-            return False
-        if s.get("from") and now.date().isoformat() < s["from"]:
-            return False
-        tab, cell = s["sent_cell"].split("!")
-        return (sh.worksheet(tab).acell(cell).value or "").strip() != now.date().isoformat()
+        return bool(self.sch) and self.is_due(sh, self.sch[1])
 
     def statuses(self):
         return [self.dcfg["branch"]["status"]] if self.sch else []
@@ -891,12 +891,39 @@ class SyncHook:
     def send(self, sh, orders):
         name, s = self.sch
         now = dt.datetime.now(self.tz)
-        text = branch_message(self.cfg, self.dcfg, now, self.log, orders)
+        self.deliver(sh, name, s, now, branch_message(self.cfg, self.dcfg, now, self.log, orders))
+
+    def tick(self, sh):
+        """Notes that do not need a stock update (the balance): sent as soon as they are due."""
+        for name, s in self.schs:
+            if s.get("every_tick") and self.is_due(sh, s):
+                now = dt.datetime.now(self.tz)
+                self.deliver(sh, name, s, now, balance_message(self.dcfg, now, self.log))
+
+    def deliver(self, sh, name, s, now, text):
         token = (os.environ.get("TELEGRAM_TOKEN") or self.dcfg["telegram"].get("token") or "").strip()
-        send_all(token, resolve_chats(token, self.dcfg, s["chat"]), [text], [], self.log, exit_on_fail=False)
-        tab, cell = s["sent_cell"].split("!")
-        sh.worksheet(tab).update_acell(cell, now.date().isoformat())
-        self.log.status(f"{now:%H:%M} chat note sent: {name}")
+        if send_all(token, resolve_chats(token, self.dcfg, s["chat"]), [text], [], self.log, exit_on_fail=False):
+            mark_sent(sh, s, now)
+            self.log.status(f"{now:%H:%M} chat note sent: {name}")
+
+
+def in_send_window(dcfg, s, now, before=None, after=None):
+    if now.weekday() not in s["weekdays"] or (s.get("from") and now.date().isoformat() < s["from"]):
+        return False
+    at = dt.datetime.combine(now.date(), hhmm(s["at"]), tzinfo=now.tzinfo)
+    before = dcfg.get("window_before", 60) if before is None else before
+    after = s.get("window_after", dcfg.get("window_after", 180)) if after is None else after
+    return at - dt.timedelta(minutes=before) <= now <= at + dt.timedelta(minutes=after)
+
+
+def sent_today(sh, s, now):
+    tab, cell = s["sent_cell"].split("!")
+    return (sh.worksheet(tab).acell(cell).value or "").strip() == now.date().isoformat()
+
+
+def mark_sent(sh, s, now):
+    tab, cell = s["sent_cell"].split("!")
+    sh.worksheet(tab).update_acell(cell, now.date().isoformat())
 
 
 # ---------- telegram ----------
@@ -986,6 +1013,7 @@ def send_all(token, ids, texts, files, log, exit_on_fail=True):
     log.status(f"sent to {len(ids) - failed} of {len(ids)}")
     if failed == len(ids) and exit_on_fail:
         sys.exit(1)
+    return len(ids) - failed
 
 
 # ---------- chat requests ----------
@@ -1088,15 +1116,12 @@ def build_report(cfg, dcfg, day, log, snap_time, out_dir, weekly):
 
 
 def due_schedule(dcfg, now):
-    """Name of the schedule whose window (send time minus/plus a margin) contains now, or None."""
+    """Name of the schedule whose window (send time minus/plus a margin) contains now, or None.
+    Schedules sent by the sync job are taken only when they ask for this workflow as a fallback."""
     for name, s in dcfg["schedules"].items():
-        if s.get("in_sync"):
-            continue  # sent by the sync job
-        if now.weekday() not in s["weekdays"] or (s.get("from") and now.date().isoformat() < s["from"]):
+        if s.get("in_sync") and not s.get("fallback"):
             continue
-        at = dt.datetime.combine(now.date(), hhmm(s["at"]), tzinfo=now.tzinfo)
-        if at - dt.timedelta(minutes=dcfg.get("window_before", 60)) <= now <= \
-                at + dt.timedelta(minutes=s.get("window_after", dcfg.get("window_after", 180))):
+        if in_send_window(dcfg, s, now):
             return name
     return None
 
@@ -1160,7 +1185,16 @@ def main():
                 wait_until(send_at)
             texts, files = [branch_message(sync.load_config(), dcfg, dt.datetime.now(tz), log)], []
         elif kind == "balance":
-            if args.wait:
+            sheet = None
+            if sch.get("in_sync") and not args.chat:
+                # fallback for the sync job: give it a head start, then send only if it has not
+                if args.wait:
+                    wait_until(send_at + dt.timedelta(minutes=sch.get("fallback_delay", 10)))
+                sheet = sync.Session(sync.load_config()).sh
+                if sent_today(sheet, sch, dt.datetime.now(tz)):
+                    log.status("already sent by the sync job")
+                    return
+            elif args.wait:
                 wait_until(send_at)
             texts, files = [balance_message(dcfg, dt.datetime.now(tz), log)], []
         else:
@@ -1191,6 +1225,8 @@ def main():
                     log.status("recipient not reachable yet, retrying")
                     time.sleep(120)
             send_all(token, ids, texts, files, log)
+            if kind == "balance" and sheet is not None:
+                mark_sent(sheet, sch, dt.datetime.now(tz))
         else:
             if not log.quiet:
                 print("\n\n----\n\n".join(texts))

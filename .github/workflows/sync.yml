@@ -39,6 +39,7 @@ jobs:
       ORDERS_API_KEY: ${{ secrets.ORDERS_API_KEY }}
       DIGEST_JSON: ${{ secrets.DIGEST_JSON }}
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      BALANCE_TOKEN: ${{ secrets.BALANCE_TOKEN }}
       NP_KEY: ${{ secrets.NP_KEY }}
       RESTOCK_JSON: ${{ secrets.RESTOCK_JSON }}
       MIRROR_JSON: ${{ secrets.MIRROR_JSON }}

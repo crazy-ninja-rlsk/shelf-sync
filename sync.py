@@ -695,6 +695,12 @@ def loop(cfg, args, log):
                 ses = Session(cfg)
             except Exception:
                 pass
+        # notes that do not wait for a stock update (the morning balance)
+        if hook:
+            try:
+                hook.tick(ses.sh)
+            except Exception as e:
+                log.status(f"{now:%H:%M} chat note failed: {type(e).__name__}")
         # report requests written to the chat bot are answered from the db this job keeps up to date
         if hook:
             try:
