@@ -894,15 +894,29 @@ class SyncHook:
         self.deliver(sh, name, s, now, branch_message(self.cfg, self.dcfg, now, self.log, orders))
 
     def tick(self, sh):
-        """Notes that do not need a stock update (the balance): sent as soon as they are due."""
+        """Notes that do not need a stock update (the balance, the evening digest from the db this
+        job keeps restored): sent as soon as they are due."""
         for name, s in self.schs:
-            if s.get("every_tick") and self.is_due(sh, s):
-                now = dt.datetime.now(self.tz)
-                self.deliver(sh, name, s, now, balance_message(self.dcfg, now, self.log))
+            if not (s.get("every_tick") and self.is_due(sh, s)):
+                continue
+            now = dt.datetime.now(self.tz)
+            if s["kind"] == "balance":
+                texts, files = [balance_message(self.dcfg, now, self.log)], []
+            else:
+                snap_time = sync.restored_time(self.cfg)
+                if not snap_time:
+                    continue  # no snapshot restored yet, try again on the next tick
+                weekly = now.weekday() == self.dcfg.get("weekly_on", 4)
+                texts, files = build_report(self.cfg, self.dcfg, now.date(), self.log, snap_time,
+                                            HERE / "reports" / "digest", weekly)
+            self.deliver(sh, name, s, now, texts, files)
 
-    def deliver(self, sh, name, s, now, text):
+    def deliver(self, sh, name, s, now, texts, files=()):
+        if isinstance(texts, str):
+            texts = [texts]
         token = (os.environ.get("TELEGRAM_TOKEN") or self.dcfg["telegram"].get("token") or "").strip()
-        if send_all(token, resolve_chats(token, self.dcfg, s["chat"]), [text], [], self.log, exit_on_fail=False):
+        if send_all(token, resolve_chats(token, self.dcfg, s["chat"]), texts, list(files), self.log,
+                    exit_on_fail=False):
             mark_sent(sh, s, now)
             self.log.status(f"{now:%H:%M} chat note sent: {name}")
 
@@ -1180,21 +1194,22 @@ def main():
 
     try:
         send_at = dt.datetime.combine(now.date(), hhmm(sch["at"]), tzinfo=tz) if sch else now
+        sheet = None
+        if sch.get("in_sync") and not args.chat:
+            # fallback for the sync job: give it a head start, then send only if it has not
+            if args.wait:
+                wait_until(send_at + dt.timedelta(minutes=sch.get("fallback_delay", 10)))
+                args.wait = False
+            sheet = sync.Session(sync.load_config()).sh
+            if sent_today(sheet, sch, dt.datetime.now(tz)):
+                log.status("already sent by the sync job")
+                return
         if kind == "branch":
             if args.wait:
                 wait_until(send_at)
             texts, files = [branch_message(sync.load_config(), dcfg, dt.datetime.now(tz), log)], []
         elif kind == "balance":
-            sheet = None
-            if sch.get("in_sync") and not args.chat:
-                # fallback for the sync job: give it a head start, then send only if it has not
-                if args.wait:
-                    wait_until(send_at + dt.timedelta(minutes=sch.get("fallback_delay", 10)))
-                sheet = sync.Session(sync.load_config()).sh
-                if sent_today(sheet, sch, dt.datetime.now(tz)):
-                    log.status("already sent by the sync job")
-                    return
-            elif args.wait:
+            if args.wait:
                 wait_until(send_at)
             texts, files = [balance_message(dcfg, dt.datetime.now(tz), log)], []
         else:
@@ -1225,7 +1240,7 @@ def main():
                     log.status("recipient not reachable yet, retrying")
                     time.sleep(120)
             send_all(token, ids, texts, files, log)
-            if kind == "balance" and sheet is not None:
+            if sheet is not None:
                 mark_sent(sheet, sch, dt.datetime.now(tz))
         else:
             if not log.quiet:
