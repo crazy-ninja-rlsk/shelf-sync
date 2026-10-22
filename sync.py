@@ -662,8 +662,9 @@ def sales_due(ws, cfg, today):
 
 def edition_fills(cfg, keys, orig, notes, pairs):
     """Notes that speak of a new edition without naming it: the article with the newest year mentioned is
-    added when the sheet has it (x-25 + "... 2026" -> x-26); the rest goes to the weekly chat note (year rule for the year_prefix family only).
-    -> ({row: new note}, [(row, reason)])"""
+    written as the short link note when the sheet has it (x-25 + "... 2026" -> x-26); the rest goes to the weekly
+    chat note (year rule for the year_prefix family only).
+    -> ({row: new note}, [row])"""
     ed = cfg.get("editions") or {}
     if not ed.get("hint"):
         return {}, []
@@ -680,7 +681,7 @@ def edition_fills(cfg, keys, orig, notes, pairs):
         m = re.match(r"(.+[-_])\d\d$", a)
         cand = f"{m.group(1)}{max(years):02d}" if m and years and a.startswith(ed.get("year_prefix", "")) else None
         if cand and cand != a and cand in have:
-            fills[r] = f"{note} {orig[have[cand]]}"
+            fills[r] = ed["fill"].format(art=orig[have[cand]])
         else:
             unclear.append(r)
     return fills, unclear
