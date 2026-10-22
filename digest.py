@@ -14,6 +14,7 @@ Shared settings (storage, database) come from the sync config; the digest's own 
 queries from digest.local.json (or the DIGEST_JSON env var). Tokens: TELEGRAM_TOKEN, BALANCE_TOKEN.
 """
 import argparse
+import collections
 import datetime as dt
 import json
 import math
@@ -733,6 +734,44 @@ def point_pdf(path, dcfg, day, title, lines, pays, made_at):
 
 # ---------- balance ----------
 
+def shipments_message(cfg, dcfg, now, log):
+    """Warehouse shipments of the day: what is still waiting to go (put there before / after the cut-off,
+    by safeguard), what went (sale checks of the warehouse in the working hours: the status is set only
+    with a check) and the returns taken in. The orders api has no status change time: an order's last
+    change stands for it, so a later edit can only move an order from "before" to "after"."""
+    c = dcfg["shipments"]; today = now.date()
+    day = dt.datetime.combine(today, dt.time())
+    at = lambda h: dt.datetime.combine(today, hhmm(h))
+    with sync.sql(cfg, cfg["sql"]["db"]) as cn:
+        sent = cn.execute(dcfg["queries"]["ship_checks"], c["db_point"], at(c["sent_from"]), at(c["sent_to"])).fetchone()[0]
+        back = cn.execute(dcfg["queries"]["ship_returns"], c["db_point"], day, day + dt.timedelta(days=1)).fetchone()[0]
+    orders, _ = sync.fetch_orders(cfg, [str(x) for x in c["ready_statuses"]])
+    meta = order_meta(cfg)
+    safe = {o["value"]: o["text"] for o in (meta.get(c["safeguard_field"]) or {}).get("options", [])}
+    cut = at(c["cutoff"])
+    groups = {"before": collections.defaultdict(list), "after": collections.defaultdict(list)}
+    for o in orders:
+        if str(o.get(c["point_field"])) != str(c["sd_point"]):
+            continue   # another point's orders
+        changed = dt.datetime.fromisoformat(o["updateAt"])
+        g = groups["before" if changed < cut else "after"]
+        g[safe.get(o.get(c["safeguard_field"])) or T("sh_none")].append((changed, o["id"]))
+    out = [T("sh_title", date=f"{today:%d.%m}"), ""]
+    for key, label in (("before", "sh_before"), ("after", "sh_after")):
+        g = groups[key]
+        out.append(T(label, t=c["cutoff"], n=sum(len(v) for v in g.values())))
+        for name, items in sorted(g.items(), key=lambda x: -len(x[1])):
+            if name in c.get("show_times", []):
+                stamp = lambda t: f"{t:%H:%M}" if t.date() == today else f"{t:%d.%m %H:%M}"
+                out.append(T("sh_safe_times", name=escape(name), n=len(items),
+                             items=", ".join(T("sh_item", id=i, t=stamp(t)) for t, i in sorted(items))))
+            else:
+                out.append(T("sh_safe", name=escape(name), n=len(items)))
+    out.append(T("sh_sent", n=sent))
+    out.append(T("sh_returns", n=back))
+    return "\n".join(out)
+
+
 def balance_message(dcfg, now, log):
     """Account balance from a json api, whole units rounded down (never show more than there is)."""
     b = dcfg["balance"]
@@ -902,6 +941,10 @@ class SyncHook:
             now = dt.datetime.now(self.tz)
             if s["kind"] == "balance":
                 texts, files = [balance_message(self.dcfg, now, self.log)], []
+            elif s["kind"] == "shipments":
+                if not sync.restored_time(self.cfg):
+                    continue  # the checks come from the db: wait until a snapshot is restored
+                texts, files = [shipments_message(self.cfg, self.dcfg, now, self.log)], []
             else:
                 snap_time = sync.restored_time(self.cfg)
                 if not snap_time:
@@ -1184,6 +1227,7 @@ def main():
     ap.add_argument("--weekly", action="store_true", help="add the weekly summary on any day")
     ap.add_argument("--balance", action="store_true", help="the balance note instead of the digest")
     ap.add_argument("--branch", action="store_true", help="the parcels-at-branch note instead of the digest")
+    ap.add_argument("--shipments", action="store_true", help="the warehouse shipments note instead of the digest")
     ap.add_argument("--schedule", help="run a schedule from the config (its kind, chat and time)")
     ap.add_argument("--no-restore", action="store_true")
     ap.add_argument("--wait", action="store_true", help="wait until the schedule's send time")
@@ -1219,7 +1263,7 @@ def main():
         return
 
     sch = dcfg["schedules"][args.schedule] if args.schedule else {}
-    kind = "balance" if args.balance else ("branch" if args.branch else sch.get("kind", "digest"))
+    kind = "balance" if args.balance else ("branch" if args.branch else ("shipments" if args.shipments else sch.get("kind", "digest")))
     chat_keys = args.chat or sch.get("chat") or dcfg["telegram"]["chat"]
 
     def wait_until(target):
@@ -1240,7 +1284,14 @@ def main():
             if sent_today(sheet, sch, dt.datetime.now(tz)):
                 log.status("already sent by the sync job")
                 return
-        if kind == "branch":
+        if kind == "shipments":
+            cfg_s = sync.load_config()
+            if os.environ.get("BACKUP_DIR"):
+                cfg_s["sql"]["backup_dir"] = os.environ["BACKUP_DIR"]
+            if not args.no_restore:
+                prepare_db(cfg_s, log, True)
+            texts, files = [shipments_message(cfg_s, dcfg, dt.datetime.now(tz), log)], []
+        elif kind == "branch":
             if args.wait:
                 wait_until(send_at)
             texts, files = [branch_message(sync.load_config(), dcfg, dt.datetime.now(tz), log)], []
