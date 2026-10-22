@@ -490,20 +490,38 @@ def add_new_articles(sh, ws, cfg, lines, settings, write):
     return new
 
 
-def fill_formulas(sh, ws, cfg, header, last):
-    """Copy the formula columns from their first row down to the last article."""
+def fill_formulas(sh, ws, cfg, header, last, log):
+    """Copy the formula columns from their first row down to the last article.
+
+    A filter left on in the sheet blocks copyPaste, so the formula is then repeated over the range instead;
+    if that fails too the step is skipped and the rest of the update goes on."""
     s = cfg["sheet"]
     src = s["formula_first_row"]
-    reqs = []
-    for name in s["formula_headers"]:
-        c = header.get(norm(name))
-        if c and last > src:
-            box = lambda r0, r1: {"sheetId": ws.id, "startRowIndex": r0, "endRowIndex": r1,
-                                  "startColumnIndex": c - 1, "endColumnIndex": c}
-            reqs.append({"copyPaste": {"source": box(src - 1, src), "destination": box(src, last),
-                                       "pasteType": "PASTE_FORMULA"}})
-    if reqs:
-        sh.batch_update({"requests": reqs})
+    cols = [header.get(norm(name)) for name in s["formula_headers"]]
+    cols = [c for c in cols if c]
+    if not cols or last <= src:
+        return
+    box = lambda c, r0, r1: {"sheetId": ws.id, "startRowIndex": r0, "endRowIndex": r1,
+                             "startColumnIndex": c - 1, "endColumnIndex": c}
+    try:
+        sh.batch_update({"requests": [{"copyPaste": {"source": box(c, src - 1, src), "destination": box(c, src, last),
+                                                     "pasteType": "PASTE_FORMULA"}} for c in cols]})
+        return
+    except gspread.exceptions.APIError:
+        pass
+    try:
+        got = ws.batch_get([f"{col_letter(c)}{src}" for c in cols], value_render_option="FORMULA")
+        reqs = []
+        for c, g in zip(cols, got):
+            f = g[0][0] if g and g[0] else ""
+            if str(f).startswith("="):
+                reqs.append({"repeatCell": {"range": box(c, src - 1, last), "fields": "userEnteredValue",
+                                            "cell": {"userEnteredValue": {"formulaValue": f}}}})
+        if reqs:
+            sh.batch_update({"requests": reqs})
+        log.status("formulas repeated (a filter is on)")
+    except gspread.exceptions.APIError as e:
+        log.status(f"formulas skipped: {type(e).__name__}")
 
 
 def column_update(grid, col, first, last, new):
@@ -1021,7 +1039,7 @@ def update(cfg, ses, log, mode, latest, args):
         for c in stamps_now:
             extra.append({"range": c, "values": [[restamp(ws.acell(c).value, now_local)]]})
         if do_orders:
-            fill_formulas(sh, ws, cfg, header, last)
+            fill_formulas(sh, ws, cfg, header, last, log)
         apply(sh, ws, p, cfg, latest["taken"] if do_stock else None, extra)
         if not args.loop:
             log.status("written")
