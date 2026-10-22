@@ -602,7 +602,10 @@ def run_once(cfg, args, log):
         set_output("need", "1")
         log.status("new snapshot")
         return
+    started = dt.datetime.now(tz)
     update(cfg, ses, log, args.mode, latest, args)
+    if args.mode in ("all", "stock") and args.write and not args.row:
+        run_log(ses, cfg, log, latest["taken"], started, args.mode, "manual")
     if args.mode in ("all", "stock") and os.environ.get("MIRROR_JSON"):
         import mirror
         mirror.run(cfg, log=log.status, force=args.reprocess)
@@ -615,6 +618,35 @@ def read_requests(ses, cfg):
     got = ses.sh.worksheet(rq["tab"]).batch_get([rq["orders"], rq["stock"]])
     val = lambda g: norm(g[0][0]) if g and g[0] else ""
     return {"orders": bool(val(got[0])), "stock": bool(val(got[1]))}
+
+
+def run_log(ses, cfg, log, taken, started, mode, reason):
+    """One row per stock update in the run log tab, newest on top, kept for keep_days (skipped when not configured)."""
+    rl = cfg.get("run_log")
+    if not rl:
+        return
+    tz = ZoneInfo(cfg["schedule"]["tz"])
+    now = dt.datetime.now(tz)
+    try:
+        ws = ses.gc.open_by_key(rl["id"]).get_worksheet_by_id(rl["gid"])
+        if ws.acell("A1").value != rl["head"][0]:
+            ws.update(range_name="A1", values=[rl["head"]], value_input_option="RAW")
+        ws.insert_row([now.strftime("%d.%m.%Y %H:%M:%S"), taken.strftime("%d.%m.%Y %H:%M:%S"),
+                       rl["modes"].get(mode, mode), rl["reasons"].get(reason, reason),
+                       round((now - started).total_seconds() / 60, 1)], index=2, value_input_option="USER_ENTERED")
+        # rows are newest first, so everything from the first row older than keep_days down is cut off
+        cutoff = now.replace(tzinfo=None) - dt.timedelta(days=rl.get("keep_days", 30))
+        col = ws.col_values(1)
+        for i, v in enumerate(col[1:], start=2):
+            try:
+                old = dt.datetime.strptime(v, "%d.%m.%Y %H:%M:%S") < cutoff
+            except ValueError:
+                continue
+            if old:
+                ws.delete_rows(i, len(col))
+                break
+    except Exception as e:
+        log.status(f"{now:%H:%M} run log failed: {type(e).__name__}")
 
 
 def clear_requests(ses, cfg, which):
@@ -664,6 +696,8 @@ def loop(cfg, args, log):
                     update(cfg, ses, log, mode, latest, args)
                     if stock:
                         done = latest["taken"].replace(second=0)
+                        if args.write:
+                            run_log(ses, cfg, log, latest["taken"], now, mode, "new" if new else "request")
                     log.status(f"{now:%H:%M} updated: {mode}" + (" (new snapshot)" if new else " (request)"))
                     if note:
                         try:
