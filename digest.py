@@ -1032,6 +1032,40 @@ def send_all(token, ids, texts, files, log, exit_on_fail=True):
 
 # ---------- chat requests ----------
 
+def keep_reissues(cfg, ups, log):
+    """Chat messages about new editions -> rows in a review tab (newest on top); nothing is changed by itself."""
+    rc = cfg.get("reissues")
+    if not rc:
+        return 0
+    words = re.compile(rc["words"], re.I)
+    art_re = re.compile(r"\b([A-Za-z]{2,4}-?\d{3,5}(?:[A-Za-z]\d)?(?:[-_/]\d{2})?)\b")
+    tz = ZoneInfo(cfg["schedule"]["tz"])
+    rows = []
+    for u in ups:
+        m = u.get("message") or {}
+        text = m.get("text") or m.get("caption") or ""
+        if not words.search(text):
+            continue
+        chat = m.get("chat") or {}
+        who = m.get("from") or {}
+        rows.append([dt.datetime.fromtimestamp(m.get("date", 0), tz).strftime("%d.%m.%Y %H:%M"),
+                     chat.get("title") or " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x),
+                     " ".join(x for x in (who.get("first_name"), who.get("last_name")) if x),
+                     ", ".join(dict.fromkeys(a.lower() for a in art_re.findall(text))), text])
+    if not rows:
+        return 0
+    import gspread
+    sh = gspread.authorize(sync.credentials(cfg)).open_by_key(rc["id"])
+    try:
+        ws = sh.worksheet(rc["tab"])
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(rc["tab"], rows=1000, cols=len(rc["head"]))
+        ws.update(range_name="A1", values=[rc["head"]], value_input_option="RAW")
+    ws.insert_rows(rows[::-1], row=2, value_input_option="RAW")
+    log.status(f"chat messages kept: {len(rows)}")
+    return len(rows)
+
+
 def poll_commands(cfg, log):
     """Requests to the bot in allowed chats ("@bot ... <keyword>") -> fresh report sent back there.
 
@@ -1045,6 +1079,8 @@ def poll_commands(cfg, log):
     ups = tg(token, "getUpdates", data={"timeout": 0, "allowed_updates": json.dumps(["message"])})
     if not ups:
         return 0
+    # messages about new editions are kept before the updates are confirmed, so a failed write retries
+    keep_reissues(cfg, ups, log)
     # confirm first, so a request that breaks the report is not repeated every minute
     tg(token, "getUpdates", data={"offset": ups[-1]["update_id"] + 1, "timeout": 0,
                                  "allowed_updates": json.dumps(["message"])})

@@ -72,6 +72,37 @@ def cell(q):
     return int(q) if float(q).is_integer() else round(q, 3)
 
 
+ART_RE = re.compile(r"\b([A-Za-z]{2,4}-?\d{3,5}(?:[A-Za-z]\d)?(?:[-_/]\d{2})?)\b")
+
+
+def edition_links(cfg, items):
+    """(article, note) -> {older: newer}: the "newer" words + X on the older row, the "replaces" words + X on the newer one."""
+    ed = cfg.get("editions") or {}
+    newer_w = re.compile(ed["newer"], re.I) if ed.get("newer") else None
+    repl_w = re.compile(ed["replaces"], re.I) if ed.get("replaces") else None
+    out = {}
+    for a, note in items:
+        a, note = norm(a).casefold(), norm(note)
+        other = [x.casefold() for x in ART_RE.findall(note) if x.casefold() != a]
+        if not a or not other:
+            continue
+        if repl_w and repl_w.search(note):
+            for o in other:
+                out[o] = a
+        elif newer_w and newer_w.search(note):
+            out[a] = other[0]
+    return out
+
+
+def newest(pairs, a):
+    """Follow older -> newer links to the last edition."""
+    seen = set()
+    while a in pairs and a not in seen:
+        seen.add(a)
+        a = pairs[a]
+    return a
+
+
 def col_letter(i):
     return gspread.utils.rowcol_to_a1(1, i).rstrip("1")
 
@@ -620,6 +651,136 @@ def read_requests(ses, cfg):
     return {"orders": bool(val(got[0])), "stock": bool(val(got[1]))}
 
 
+def sales_due(ws, cfg, today):
+    """Sales columns are refreshed once a day: due while their stamp shows another date."""
+    sc = cfg.get("sales")
+    if not sc:
+        return False
+    v = ws.acell(sc["stamp_cell"]).value or ""
+    return today.strftime("%d.%m.%Y") not in v
+
+
+def edition_fills(cfg, keys, orig, notes, pairs):
+    """Notes that speak of a new edition without naming it: the article with the newest year mentioned is
+    added when the sheet has it (x-25 + "... 2026" -> x-26); the rest goes to the weekly chat note (year rule for the year_prefix family only).
+    -> ({row: new note}, [(row, reason)])"""
+    ed = cfg.get("editions") or {}
+    if not ed.get("hint"):
+        return {}, []
+    hint = re.compile(ed["hint"], re.I)
+    have = {a: r for r, a in keys.items()}
+    fills, unclear = {}, []
+    for r, a in keys.items():
+        note = notes.get(r, "")
+        if not note or not hint.search(note) or a in pairs:
+            continue
+        if [x for x in ART_RE.findall(note) if x.casefold() != a]:
+            continue
+        years = [int(y) for y in re.findall(r"\b20(\d\d)\b", note)]
+        m = re.match(r"(.+[-_])\d\d$", a)
+        cand = f"{m.group(1)}{max(years):02d}" if m and years and a.startswith(ed.get("year_prefix", "")) else None
+        if cand and cand != a and cand in have:
+            fills[r] = f"{note} {orig[have[cand]]}"
+        else:
+            unclear.append(r)
+    return fills, unclear
+
+
+def edition_notify(cfg, unclear, grid, note_col, now, log):
+    """Once a week the rows whose note speaks of a new edition without naming it go to the team chat."""
+    ed = cfg.get("editions") or {}
+    if not unclear or not ed.get("notify_chat") or now.weekday() != ed.get("notify_weekday"):
+        return
+    import digest
+    from html import escape
+    token = (os.environ.get("TELEGRAM_TOKEN") or digest.load_digest_config()["telegram"].get("token") or "").strip()
+    def title(r):
+        t = re.sub(ed.get("name_strip", "$^"), "", norm(grid[r - 1][1]), flags=re.I)
+        return norm(t.replace(norm(grid[r - 1][0]), ""))[:70]
+    lines = [ed["notify_line"].format(art=escape(grid[r - 1][0]), name=escape(title(r)), row=r,
+                                      note=escape(norm(grid[r - 1][note_col - 1]) if note_col else ""))
+             for r in unclear]
+    text = "\n".join([ed["notify_head"].format(n=len(unclear)), ""] + lines + ["", ed["notify_foot"]])
+    digest.send(token, ed["notify_chat"], [text], [])
+    log.status(f"{now:%H:%M} editions note sent: {len(unclear)}")
+
+
+def sales_update(ses, cfg, log, write=True):
+    """Sales per article for three periods into the sales columns (whole columns, zero = empty)."""
+    sc, s = cfg["sales"], cfg["sheet"]
+    tz = ZoneInfo(cfg["schedule"]["tz"])
+    now = dt.datetime.now(tz)
+    today = now.date()
+    day = dt.timedelta(days=1)
+    # [from, to) per column; the year-ago window starts on today's date a year back
+    year_ago = today - dt.timedelta(days=365)
+    spans = [(today - p["days"] * day, today) if "days" in p else
+             (year_ago, year_ago + p["year_ago_days"] * day) for p in sc["periods"]]
+    params = [x for a, b in spans for x in (a, b)] + [min(a for a, _ in spans)]
+    with sql(cfg, cfg["sql"]["db"]) as cn:
+        rows = cn.execute(sc["query"], *params).fetchall()
+    per = [{} for _ in spans]
+    for r in rows:
+        a = norm(r[0]).casefold()
+        for i, q in enumerate(r[1:]):
+            if a and q:
+                per[i][a] = per[i].get(a, 0.0) + float(q)
+    ws = ses.ws
+    grid = ws.get_all_values()
+    header = {}
+    for i, v in enumerate(grid[s["header_row"] - 1]):
+        header.setdefault(norm(v), i + 1)
+    first = s["first_row"]
+    last = last_article_row(grid, first)
+    keys = {r: norm(grid[r - 1][0]).casefold() for r in range(first, last + 1) if norm(grid[r - 1][0])}
+
+    # an older edition's history continues under the newest one in the year-ago column:
+    # the pairs of the restock settings plus the notes column
+    note_col = header.get(norm(sc.get("note_header", "")))
+    notes = {r: norm(grid[r - 1][note_col - 1]) if note_col and note_col - 1 < len(grid[r - 1]) else ""
+             for r in keys}
+    pairs = {}
+    raw = os.environ.get("RESTOCK_JSON")
+    if not raw and (HERE / "restock.local.json").exists():
+        raw = (HERE / "restock.local.json").read_text(encoding="utf-8")
+    if raw:
+        pairs = {norm(k).casefold(): norm(v).casefold()
+                 for k, v in json.loads(raw).get("editions", {}).get("pairs", {}).items()}
+    orig = {r: norm(grid[r - 1][0]) for r in keys}
+    fills, unclear = edition_fills(cfg, keys, orig, notes, pairs)
+    for r, text in fills.items():
+        notes[r] = text
+    pairs.update(edition_links(cfg, [(keys[r], notes[r]) for r in keys]))
+    for i, p in enumerate(sc["periods"]):
+        if p.get("with_older_editions"):
+            for old in pairs:
+                top = newest(pairs, old)
+                if top != old and per[i].get(old):
+                    per[i][top] = per[i].get(top, 0.0) + per[i][old]
+
+    data = []
+    for p, totals in zip(sc["periods"], per):
+        col = header.get(norm(p["header"]))
+        if not col:
+            log(f"No column: {p['header']}")
+            continue
+        rng, changed = column_update(grid, col, first, last, {r: cell(totals.get(a, 0)) for r, a in keys.items()})
+        data.append(rng)
+        log(f"Column {col_letter(col)} {p['header']}: {changed} cells change")
+    if fills:
+        log(f"Notes completed: {len(fills)}")
+    if not write:
+        return
+    if note_col:
+        data += [{"range": f"{col_letter(note_col)}{r}", "values": [[t]]} for r, t in fills.items()]
+    data.append({"range": sc["stamp_cell"], "values": [[restamp(sc["stamp"], now)]]})
+    ws.batch_update(data, value_input_option="RAW")
+    try:
+        edition_notify(cfg, unclear, grid, note_col, now, log)
+    except Exception as e:
+        log.status(f"{now:%H:%M} editions note failed: {type(e).__name__}")
+
+
 def run_log(ses, cfg, log, taken, started, mode, reason):
     """One row per stock update in the run log tab, newest on top, kept for keep_days (skipped when not configured)."""
     rl = cfg.get("run_log")
@@ -698,6 +859,13 @@ def loop(cfg, args, log):
                         done = latest["taken"].replace(second=0)
                         if args.write:
                             run_log(ses, cfg, log, latest["taken"], now, mode, "new" if new else "request")
+                            # sales for the three periods: once a day, with the first stock update of the morning
+                            try:
+                                if sales_due(ses.ws, cfg, now.date()):
+                                    sales_update(ses, cfg, log)
+                                    log.status(f"{now:%H:%M} sales updated")
+                            except Exception as e:
+                                log.status(f"{now:%H:%M} sales failed: {type(e).__name__}")
                     log.status(f"{now:%H:%M} updated: {mode}" + (" (new snapshot)" if new else " (request)"))
                     if note:
                         try:

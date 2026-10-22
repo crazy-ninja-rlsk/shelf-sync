@@ -182,15 +182,14 @@ def setup(tab):
 def build():
     c = _C; cfg = c["cfg"]; today = dt.date.today()
     newer = dict(R["editions"]["pairs"]); gone = {a: True for a in R["editions"]["gone"]}
-    ART = re.compile(r"([A-Za-z]{2,4}-?\d{3,5}(?:[A-Za-z]\d)?(?:[-_/]\d{2})?)")
-    new_words = re.compile(R["edition_words"]["newer"]); oop = R["edition_words"]["out_of_print"]
+    oop = R["edition_words"]["out_of_print"]
     plan, sheetname = {}, {}
     for r in c["stock_rows"]:
         r = list(r) + [""] * 16; a = sync.norm(r[0]); note = " ".join(str(r[15] or "").split())
         if a and note:
-            # a note naming another item = a newer edition; the out-of-print words alone = never proposed
-            other = [x for x in ART.findall(note) if x.lower() != a.lower()]
-            if other and new_words.search(note.lower()): newer[a.lower()] = other[0].lower()
+            # editions linked by the note (the rule shared with the sales columns); the out-of-print words alone = never proposed
+            link = sync.edition_links(cfg, [(a, note)])
+            if link: newer.update(link)
             elif oop in note.lower(): gone.setdefault(a.lower(), True)
         if owns(a, PFXS):
             plan[a.lower()] = float(r[12]) if str(r[12]).strip() != "" else 0.0
