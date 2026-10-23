@@ -200,20 +200,22 @@ def restore(cfg, bak):
 
 
 def read_stock(cfg):
-    """-> ({article: {location: qty}}, {article: title} for every article known to the db)"""
+    """-> ({article: {location: qty}}, {article: title} for every article known to the db,
+           {article: article as written in the db})"""
     with sql(cfg, cfg["sql"]["db"]) as cn:
-        known = {}
+        known, spelled = {}, {}
         for r in cn.execute(cfg["sql"]["articles_query"]).fetchall():
             a = norm(r[0]).casefold()
             if a and a not in known:
                 known[a] = norm(r[1]) if len(r) > 1 else ""
+                spelled[a] = norm(r[0])
         stock = {}
         for a, loc, q in cn.execute(cfg["sql"]["stock_query"]).fetchall():
             a, loc = norm(a).casefold(), norm(loc)
             if a and loc and q:
                 stock.setdefault(a, {})
                 stock[a][loc] = stock[a].get(loc, 0.0) + float(q)
-    return stock, known
+    return stock, known, spelled
 
 
 # ---------- orders api ----------
@@ -478,15 +480,42 @@ def add_new_articles(sh, ws, cfg, lines, settings, write):
             new.setdefault(key, raw)
     new = sorted(new.values(), key=str.casefold)
     if write and new:
-        last = last_article_row(col_a, s["first_row"])
-        sh.batch_update({"requests": [{"insertDimension": {
-            "range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": last, "endIndex": last + len(new)},
-            "inheritFromBefore": True}}]})
-        mark = s["new_article_mark_col"]
-        ws.batch_update([
-            {"range": f"A{last + 1}:A{last + len(new)}", "values": [[a] for a in new]},
-            {"range": f"{mark}{last + 1}:{mark}{last + len(new)}", "values": [[s["new_article_mark"]]] * len(new)},
-        ], value_input_option="RAW")
+        append_articles(sh, ws, cfg, col_a, new, s["new_article_mark"])
+    return new
+
+
+def append_articles(sh, ws, cfg, col_a, new, mark_text):
+    s = cfg["sheet"]
+    last = last_article_row(col_a, s["first_row"])
+    sh.batch_update({"requests": [{"insertDimension": {
+        "range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": last, "endIndex": last + len(new)},
+        "inheritFromBefore": True}}]})
+    mark = s["new_article_mark_col"]
+    ws.batch_update([
+        {"range": f"A{last + 1}:A{last + len(new)}", "values": [[a] for a in new]},
+        {"range": f"{mark}{last + 1}:{mark}{last + len(new)}", "values": [[mark_text]] * len(new)},
+    ], value_input_option="RAW")
+
+
+def add_stock_articles(gc, sh, ws, cfg, stock, spelled, write):
+    """Articles with stock whose start is listed in another sheet go to the end of the list if missing.
+
+    Stock counts the same locations as the sum column; the start must be followed by the separator."""
+    x, s = cfg["stock_articles"], cfg["sheet"]
+    rows = gc.open_by_key(x["id"]).worksheet(x["tab"]).get_all_values()[x["first_row"] - 1:]
+    starts = {norm(r[0]).casefold() + x["sep"] for r in rows if r and norm(r[0])}
+    header = ws.row_values(s["header_row"])
+    loc_first = gspread.utils.a1_to_rowcol(s["loc_first_col"] + "1")[1]
+    ignore = {norm(v) for v in cfg.get("ignore_locations", [])}
+    locs = {norm(v) for v in header[loc_first - 1:] if norm(v)} - ignore
+    skip = {norm(v).casefold() for v in cfg.get("ignore_articles", [])}
+    col_a = ws.get(f"A1:A{ws.row_count}")
+    have = {norm(r[0]).casefold() for r in col_a if r}
+    new = sorted((spelled.get(a, a) for a, per in stock.items()
+                  if a not in have and a not in skip and any(a.startswith(p) for p in starts)
+                  and sum(max(q, 0.0) for loc, q in per.items() if loc in locs) > 0), key=str.casefold)
+    if write and new:
+        append_articles(sh, ws, cfg, col_a, new, x["mark"])
     return new
 
 
@@ -939,7 +968,7 @@ def update(cfg, ses, log, mode, latest, args):
     sh, ws = ses.sh, ses.ws
     write = args.write and not args.row
 
-    stock, known = {}, {}
+    stock, known, spelled = {}, {}, {}
     if do_stock:
         have = None if args.fresh else restored_time(cfg)
         if have and abs((have - latest["taken"]).total_seconds()) < 60:
@@ -952,7 +981,7 @@ def update(cfg, ses, log, mode, latest, args):
             t0 = time.time()
             restore(cfg, cfg["sql"].get("server_backup_path") or str(bak))
             log(f"Restored in {time.time() - t0:.0f}s")
-        stock, known = read_stock(cfg)
+        stock, known, spelled = read_stock(cfg)
         log(f"Articles in db: {len(known)}, with stock: {len(stock)}")
 
     # orders from the api: new articles first, because inserting rows shifts everything below
@@ -976,6 +1005,14 @@ def update(cfg, ses, log, mode, latest, args):
     if lines is not None:
         new_articles = add_new_articles(sh, ws, cfg, lines, settings, write)
         log(f"New articles from orders: {len(new_articles)}" + (f" ({', '.join(new_articles[:15])})" if new_articles else ""))
+    stock_articles = None
+    if do_stock and "stock_articles" in cfg:
+        try:
+            stock_articles = add_stock_articles(ses.gc, sh, ws, cfg, stock, spelled, write)
+            log(f"New articles with stock: {len(stock_articles)}"
+                + (f" ({', '.join(stock_articles[:15])})" if stock_articles else ""))
+        except Exception as e:
+            log.status(f"articles with stock skipped: {type(e).__name__}")
 
     file_totals = None
     if settings and "order_file" in cfg:
@@ -1024,8 +1061,10 @@ def update(cfg, ses, log, mode, latest, args):
                     per[a] = per.get(a, 0.0) + q
             put(title, {r: cell(per.get(a, 0)) for r, a in keys.items()})
         stamps_now.append(s["api_stamp_cell"])
+    if lines is not None or stock_articles is not None:
+        added = len(new_articles) + len(stock_articles or [])
         extra.append({"range": s["new_articles_stamp_cell"], "values": [[
-            s["new_articles_stamp"].format(n=len(new_articles)) if new_articles else s["new_articles_stamp_none"]]]})
+            s["new_articles_stamp"].format(n=added) if added else s["new_articles_stamp_none"]]]})
     if file_totals is not None:
         for title, per in file_totals.items():
             put(title, {r: cell(per.get(a, 0)) for r, a in keys.items()})
@@ -1038,7 +1077,7 @@ def update(cfg, ses, log, mode, latest, args):
         now_local = dt.datetime.now(tz)
         for c in stamps_now:
             extra.append({"range": c, "values": [[restamp(ws.acell(c).value, now_local)]]})
-        if do_orders:
+        if do_orders or stock_articles:
             fill_formulas(sh, ws, cfg, header, last, log)
         apply(sh, ws, p, cfg, latest["taken"] if do_stock else None, extra)
         if not args.loop:
