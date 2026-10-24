@@ -41,6 +41,7 @@ jobs:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       BALANCE_TOKEN: ${{ secrets.BALANCE_TOKEN }}
       NP_KEY: ${{ secrets.NP_KEY }}
+      MARKET_KEY: ${{ secrets.MARKET_KEY }}
       RESTOCK_JSON: ${{ secrets.RESTOCK_JSON }}
       MIRROR_JSON: ${{ secrets.MIRROR_JSON }}
       MODE: ${{ inputs.mode || 'loop' }}

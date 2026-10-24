@@ -953,6 +953,16 @@ class SyncHook:
                 texts, files = build_report(self.cfg, self.dcfg, now.date(), self.log, snap_time,
                                             HERE / "reports" / "digest", weekly)
             self.deliver(sh, name, s, now, texts, files)
+        # new marketplace orders: checked every minute, each order sent once
+        if self.dcfg.get("market"):
+            import market
+            token = (os.environ.get("TELEGRAM_TOKEN") or self.dcfg["telegram"].get("token") or "").strip()
+            try:
+                ids = resolve_chats(token, self.dcfg, self.dcfg["market"]["chat"])
+                market.tick(self.cfg, self.dcfg, sh, dt.datetime.now(self.tz), self.log,
+                            lambda texts: send_all(token, ids, texts, [], self.log, exit_on_fail=False))
+            except Exception as e:
+                self.log.status(f"market orders failed: {type(e).__name__}")
 
     def deliver(self, sh, name, s, now, texts, files=()):
         if isinstance(texts, str):
