@@ -205,9 +205,21 @@ def skipped(c, skip):
 
 # ---------- plan ----------
 
-def match_value(g, values):
+def bare(s):
+    return re.sub("['\u2019\u02bc`]", "", key(s))
+
+
+def match_value(g, values, suffix=""):
     size = g["size"] or g["name_size"]
-    for cand in (size, g["colour"]):
+    for cand in (size, suffix):
+        if cand and key(cand) in values:
+            return key(cand)
+    # a suffix that is not a value name itself (x-3xl, x-h): its aliases, among the values this item has
+    by_bare = {bare(v): v for v in values}
+    for alias in M.get("suffix_values", {}).get(suffix, []):
+        if bare(alias) in by_bare:
+            return by_bare[bare(alias)]
+    for cand in (g["colour"],):
         if cand and key(cand) in values:
             return key(cand)
     if g["colour"]:
@@ -220,9 +232,17 @@ def match_value(g, values):
 
 
 def shop_code(c, shop):
+    """The code itself when the shop has it, else the longest start before a "-" or "_" suffix that the shop has
+    (x-ukr, x-eng, x-s, x_2 -> x: one shop item with options)."""
     k = key(c)
-    if k not in shop and "_" in k and k.split("_")[0] in shop:
-        return k.split("_")[0]
+    cut = k
+    while k not in shop:
+        i = max(cut.rfind("-"), cut.rfind("_"))
+        if i <= 0:
+            break
+        cut = cut[:i]
+        if cut in shop:
+            return cut
     return k
 
 
@@ -250,7 +270,7 @@ def plan(goods, shop, dictionary, terms, links, skip):
         items = shop.get(a)
         if target is None and items:
             vals = items[0]["values"]
-            v = match_value(g, vals) if vals else ""
+            v = match_value(g, vals, key(g["code"])[len(a):].lstrip("-_")) if vals else ""
             if v is not None:
                 target = (a, v)
             elif g["stock"] > 0:
@@ -389,6 +409,7 @@ def report(sh, changes, problems, mode, taken, now, state):
 def run(cfg, log=print, write=None, force=False):
     """One pass on the snapshot already restored by the sync job."""
     load_config()
+    M.setdefault("suffix_values", cfg.get("suffix_values", {}))
     write = M.get("write", False) if write is None else write
     tz = ZoneInfo(cfg["schedule"]["tz"])
     now = dt.datetime.now(tz)
