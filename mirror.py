@@ -125,12 +125,13 @@ def load_shop(cn, p, goods, links, cfg):
             shop[k].append(r)
     by_option = option_codes(cn, p, shop)
     want = {by_option[key(g["code"])][0] if key(g["code"]) in by_option else shop_code(g["code"], shop)
-            for g in goods if g["family"]} | {a for a, _v in links.values()} | {a for a in shop if marked(a)}
+            for g in goods if g["family"]} | {a for a, _v in links.values()} | {a for a in shop if marked(a)} \
+        | {a for a, _v in by_option.values()}  # items with option codes: per-option delivery days
     ids = [r["id"] for a in want for r in shop.get(a, [])]
     opts, dictionary = [], defaultdict(set)
     if ids:
         with cn.cursor() as cur:
-            cur.execute(f"SELECT v.product_option_value_id id, v.product_id, v.option_id, v.quantity q, v.price, "
+            cur.execute(f"SELECT v.product_option_value_id id, v.product_id, v.option_id, v.quantity q, v.price, v.sku, v.points, "
                         f"od.name oname, vd.name vname FROM {p}product_option_value v "
                         f"JOIN {p}option_description od ON od.option_id = v.option_id AND od.language_id = {lang} "
                         f"JOIN {p}option_value_description vd ON vd.option_value_id = v.option_value_id "
@@ -336,14 +337,34 @@ def plan(goods, shop, dictionary, terms, links, skip, by_option=None):
             elif want != r["status"]:
                 changes.append(("product", r["id"], "status", r["status"], want, r["model"], "status"))
 
+    # delivery days: an item with option codes goes by its options' own codes (each option value keeps its days
+    # in `points` as days + 1, 0 = unknown, read by the product page); an item without them by the item code
+    opt_stock = defaultdict(float)
+    for code_key, n in stock.items():
+        if code_key in by_option:
+            opt_stock[by_option[code_key]] += n
     for a, items in shop.items():
+        term = next((n for pre, n in terms if a.startswith(pre)), None)
         for r in items:
             if r["status"] != 1:
                 continue
-            if stock.get(a, 0) > 0 or total_by_code.get(a, 0) > 0:
+            coded = [(v, o) for v, rows in r["values"].items() for o in rows if key(o.get("sku"))]
+            if coded:
+                days = []
+                for v, o in coded:
+                    # stock by the option code first; family goods matched by the item code and size/colour too
+                    dv = 0 if opt_stock.get((a, v), 0) > 0 or qty.get(a, {}).get(v, 0) > 0 else term
+                    want_points = 0 if dv is None else dv + 1
+                    if dv is not None:
+                        days.append(dv)
+                    if want_points != o.get("points", 0):
+                        changes.append(("option", o["id"], "points", o.get("points", 0), want_points, r["model"],
+                                        f"{o['oname'].rstrip(':')}: {o['vname']}"))
+                d = min(days) if days else None
+            elif stock.get(a, 0) > 0 or total_by_code.get(a, 0) > 0:
                 d = 0
             else:
-                d = next((n for pre, n in terms if a.startswith(pre)), None)
+                d = term
             if d is not None and d != r["days"]:
                 changes.append(("product", r["id"], "days", r["days"], d, r["model"], "days"))
 
@@ -372,7 +393,7 @@ def plan(goods, shop, dictionary, terms, links, skip, by_option=None):
 def apply(cn, p, changes, chunk=500):
     """Guarded UPDATEs grouped by (field, old -> new); one read-back tells what really changed."""
     table = {"product": (f"{p}product", "product_id"), "option": (f"{p}product_option_value", "product_option_value_id")}
-    field = {"days": M["days_field"], "quantity": "quantity", "status": "status"}
+    field = {"days": M["days_field"], "quantity": "quantity", "status": "status", "points": "points"}
     groups = defaultdict(list)
     for c in changes:
         groups[(c[0], c[2], c[3], c[4])].append(c)
