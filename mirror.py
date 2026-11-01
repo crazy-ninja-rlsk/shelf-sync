@@ -90,6 +90,28 @@ def prices(cfg):
     return out
 
 
+def marks():
+    return [m.casefold() for m in M.get("marks") or [M["mark"]]]
+
+
+def marked(a):
+    return any(m in a for m in marks())
+
+
+def option_codes(cn, p, shop):
+    """{option code: (item code, value)}: the shop's own codes of option values, checked before the item code."""
+    lang, by_id = int(M["lang"]), {r["id"]: a for a, items in shop.items() for r in items[:1]}
+    out = {}
+    with cn.cursor() as cur:
+        cur.execute(f"SELECT v.sku, v.product_id, vd.name vname FROM {p}product_option_value v "
+                    f"JOIN {p}option_value_description vd ON vd.option_value_id = v.option_value_id "
+                    f"AND vd.language_id = {lang} WHERE v.sku <> ''")
+        for r in cur.fetchall():
+            if key(r["sku"]) and r["product_id"] in by_id:
+                out.setdefault(key(r["sku"]), (by_id[r["product_id"]], key(r["vname"])))
+    return out
+
+
 def load_shop(cn, p, goods, links, cfg):
     lang = int(M["lang"])
     prods = catalogue(cfg)
@@ -101,9 +123,9 @@ def load_shop(cn, p, goods, links, cfg):
             r["name"] = " ".join(str(r["name"] or "").split())
             r["values"], r["option_ids"] = {}, set()
             shop[k].append(r)
-    mark = M["mark"].casefold()
-    want = {shop_code(g["code"], shop) for g in goods if g["family"]} | {a for a, _v in links.values()} \
-        | {a for a in shop if mark in a}
+    by_option = option_codes(cn, p, shop)
+    want = {by_option[key(g["code"])][0] if key(g["code"]) in by_option else shop_code(g["code"], shop)
+            for g in goods if g["family"]} | {a for a, _v in links.values()} | {a for a in shop if marked(a)}
     ids = [r["id"] for a in want for r in shop.get(a, [])]
     opts, dictionary = [], defaultdict(set)
     if ids:
@@ -128,7 +150,7 @@ def load_shop(cn, p, goods, links, cfg):
             r["values"] = by_item.get(r["id"], {})
             r["option_ids"] = {o["option_id"] for v in r["values"].values() for o in v}
             r["has_price"] = float(r["price"]) > 0 or any(float(o["price"]) > 0 for v in r["values"].values() for o in v)
-    return shop, dictionary
+    return shop, dictionary, by_option
 
 
 def fill_names(cn, p, problems, shop):
@@ -157,7 +179,6 @@ def places(cfg, gc):
 def read_goods(cfg, locs):
     """goods_query -> (code, name, barcode, size, colour, group, location, qty) per item and location."""
     groups = tuple(M["groups"])
-    mark = M["mark"].casefold()
     size_in_name = re.compile(M["size_in_name"])
     goods, per_loc = {}, defaultdict(lambda: defaultdict(float))
     with sync.sql(cfg, cfg["sql"]["db"]) as cn:
@@ -168,7 +189,7 @@ def read_goods(cfg, locs):
                 m = size_in_name.search(name)
                 goods[gid] = dict(code=c, name=name, barcode=bc, size=(size or "").strip(), colour=(colour or "").strip(),
                                   name_size=m.group(1) if m else "",
-                                  family=(grp or "")[:len(groups[0])] in groups or mark in c.casefold())
+                                  family=(grp or "")[:len(groups[0])] in groups or marked(c.casefold()))
             if loc and qty and sync.norm(loc) in locs:
                 per_loc[gid][sync.norm(loc)] += float(qty)
     for gid, g in goods.items():
@@ -246,7 +267,8 @@ def shop_code(c, shop):
     return k
 
 
-def plan(goods, shop, dictionary, terms, links, skip):
+def plan(goods, shop, dictionary, terms, links, skip, by_option=None):
+    by_option = by_option or {}
     changes = []   # (table, id, field, old, new, code, what)
     problems = []  # reason, code, name, barcode, qty, details
 
@@ -266,7 +288,9 @@ def plan(goods, shop, dictionary, terms, links, skip):
             a, v = links[g["barcode"]]
             if a in shop:
                 target = (a, v if v in shop[a][0]["values"] else "")
-        a = shop_code(g["code"], shop)
+        if target is None and key(g["code"]) in by_option:  # the option's own code first, then the item code
+            target = by_option[key(g["code"])]
+        a = target[0] if target else shop_code(g["code"], shop)
         items = shop.get(a)
         if target is None and items:
             vals = items[0]["values"]
@@ -289,7 +313,7 @@ def plan(goods, shop, dictionary, terms, links, skip):
         if target:
             qty[target[0]][target[1]] += g["stock"]
 
-    scope = set(qty) | set(total_by_code) | {a for a in shop if M["mark"].casefold() in a}
+    scope = set(qty) | set(total_by_code) | {a for a in shop if marked(a)}
     for a in sorted(scope):
         q = qty.get(a, {})
         for r in shop[a]:
@@ -435,18 +459,18 @@ def run(cfg, log=print, write=None, force=False):
     goods = read_goods(cfg, places(cfg, gc))
     cn, p = db_connect()
     try:
-        shop, dictionary = load_shop(cn, p, goods, links, cfg)
+        shop, dictionary, by_option = load_shop(cn, p, goods, links, cfg)
         g = M["guards"]
         stop = []
         if not taken or (now - taken).total_seconds() > g["max_snapshot_age_hours"] * 3600:
             stop.append(T["guard_old"])
         if sum(1 for x in goods if x["stock"] > 0) < g["min_items_with_stock"]:
             stop.append(T["guard_few"])
-        fam = [r for a, items in shop.items() if M["mark"].casefold() in a for r in items if r["status"] == 1]
+        fam = [r for a, items in shop.items() if marked(a) for r in items if r["status"] == 1]
         if fam and sum(1 for r in fam if not r["has_price"]) / len(fam) > g["max_zero_price_share"]:
             stop.append(T["guard_prices"])
 
-        changes, problems = plan(goods, shop, dictionary, terms, links, skip)
+        changes, problems = plan(goods, shop, dictionary, terms, links, skip, by_option)
         problems = fill_names(cn, p, problems, shop)
         statements = 0
         if stop:
