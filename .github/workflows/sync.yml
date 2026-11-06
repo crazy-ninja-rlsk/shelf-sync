@@ -44,6 +44,7 @@ jobs:
       MARKET_KEY: ${{ secrets.MARKET_KEY }}
       RESTOCK_JSON: ${{ secrets.RESTOCK_JSON }}
       MIRROR_JSON: ${{ secrets.MIRROR_JSON }}
+      EXPORT_JSON: ${{ secrets.EXPORT_JSON }}
       MODE: ${{ inputs.mode || 'loop' }}
       ANY_TIME: ${{ inputs.any_time && '--any-time' || '' }}
       FORCE: ${{ inputs.force && '--reprocess' || '' }}

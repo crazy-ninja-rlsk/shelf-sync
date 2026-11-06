@@ -687,6 +687,19 @@ def run_once(cfg, args, log):
     if args.mode in ("all", "stock") and os.environ.get("MIRROR_JSON"):
         import mirror
         mirror.run(cfg, log=log.status, force=args.reprocess)
+    if args.mode in ("all", "stock"):
+        send_copy(cfg, latest, log)
+
+
+def send_copy(cfg, latest, log):
+    """The small read-only copy follows every fresh snapshot; a failure here never stops the job."""
+    if not os.environ.get("EXPORT_JSON"):
+        return
+    try:
+        import export
+        export.run(cfg, latest["taken"], log.status)
+    except Exception as e:
+        log.status(f"copy failed: {type(e).__name__}")
 
 
 def read_requests(ses, cfg):
@@ -934,6 +947,8 @@ def loop(cfg, args, log):
                             mirror.run(cfg, log=log.status)
                         except Exception as e:
                             log.status(f"{now:%H:%M} mirror failed: {type(e).__name__}")
+                    if stock:
+                        send_copy(cfg, latest, log)
                 finally:
                     clear_requests(ses, cfg, [w for w in ("orders", "stock") if req.get(w)])
         except Exception as e:
