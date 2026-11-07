@@ -25,8 +25,8 @@ permissions:
   actions: write
 
 concurrency:
-  # one long job at a time, the next scheduled one waits in the queue; manual runs do not wait for it
-  group: ${{ github.event_name == 'schedule' && 'loop' || format('manual-{0}', github.run_id) }}
+  # one long job at a time: scheduled runs and manual loop runs share the queue; single manual updates do not wait
+  group: ${{ (github.event_name == 'schedule' || inputs.mode == 'loop') && 'loop' || format('manual-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
